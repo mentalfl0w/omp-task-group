@@ -11,17 +11,13 @@
     "oh-my-pi",
     "omp-plugin",
     "omp-extension",
-    "pi",
-    "pi-agent",
-    "pi-package",
-    "pi-extension",
     "task-group",
     "fanout",
     "join",
     "swarm"
   ],
   "license": "MIT",
-  "author": "",
+  "author": "Dylan Liu",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "bun build src/index.ts --outdir dist --target bun",
@@ -31,11 +27,6 @@
     "lint:private-api": "bun run scripts/check-private-imports.ts"
   },
   "omp": {
-    "extensions": [
-      "./dist/index.js"
-    ]
-  },
-  "pi": {
     "extensions": [
       "./dist/index.js"
     ]
