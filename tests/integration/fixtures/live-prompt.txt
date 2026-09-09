@@ -1,0 +1,5 @@
+Call the eval tool with language "js", timeout 0, and code set to EXACTLY the single envelope below — the whole code parameter must be only the ompTaskGroup(...) call (outer whitespace and one terminal semicolon are allowed, nothing else):
+
+ompTaskGroup({"context":"Trivial probe. Each child must reply with exactly the single word given in its task.","label":"live-p0","tasks":[{"name":"probe-1","agent":"sonic","task":"Reply with exactly: ok1"},{"name":"probe-2","agent":"sonic","task":"Reply with exactly: ok2"},{"name":"probe-3","agent":"sonic","task":"Reply with exactly: ok3"},{"name":"probe-4","agent":"sonic","task":"Reply with exactly: ok4"},{"name":"probe-5","agent":"sonic","task":"Reply with exactly: ok5"},{"name":"probe-6","agent":"sonic","task":"Reply with exactly: ok6"},{"name":"probe-7","agent":"sonic","task":"Reply with exactly: ok7"},{"name":"probe-8","agent":"sonic","task":"Reply with exactly: ok8"},{"name":"probe-9","agent":"sonic","task":"Reply with exactly: ok9"},{"name":"probe-10","agent":"sonic","task":"Reply with exactly: ok10"}]})
+
+After the tool returns, summarize the outcome in one sentence. Do not call any other tool.
