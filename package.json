@@ -1,8 +1,11 @@
 {
   "name": "omp-task-group",
   "description": "Atomic multi-agent coordination layer for oh-my-pi (OMP): fan-out N independent subagents, join, and return exactly one logical result to the parent. Not a workflow engine.",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "keywords": [
     "omp",
     "oh-my-pi",
@@ -10,20 +13,19 @@
     "omp-extension",
     "pi",
     "pi-agent",
+    "pi-package",
+    "pi-extension",
     "task-group",
     "fanout",
     "join",
     "swarm"
   ],
   "license": "MIT",
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
+  "author": "",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "bun build src/index.ts --outdir dist --target bun",
+    "dev": "bun run src/index.ts",
     "test": "bun test tests/unit",
     "test:integration": "TEST_INTEGRATION=1 bun test tests/integration",
     "lint:private-api": "bun run scripts/check-private-imports.ts"
