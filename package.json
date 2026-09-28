@@ -1,10 +1,11 @@
 {
   "name": "omp-task-group",
   "description": "Atomic multi-agent coordination layer for oh-my-pi (OMP): fan-out N independent subagents, join, and return exactly one logical result to the parent. Not a workflow engine.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "skills"
   ],
   "keywords": [
     "omp",
