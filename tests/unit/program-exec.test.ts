@@ -342,4 +342,48 @@ describe("compiled program execution (mocked kernel)", () => {
     expect(kernel.phases.some((p) => p.includes("items pushed: 6"))).toBe(true);
     expect(kernel.phases.some((p) => p.includes("draining"))).toBe(true);
   });
+  test("fanout emits its completed result through OMP's console JSON view without a display global", async () => {
+    const logged: unknown[] = [];
+    let settled = 0;
+    const program = compileFanoutProgram(SPEC3, { groupId: "tg-console" });
+    const agent = async (_prompt: string, opts: { label: string }) => ({
+      handle: `agent://${opts.label}`,
+      wait: async () => {
+        settled += 1;
+        return `result:${opts.label}`;
+      },
+      cancel: async () => {},
+    });
+    const createRunner = new Function(
+      "agent", "wait", "completion", "workpool", "console", "phase", "tool",
+      `return async () => {\n${program}\n}`,
+    ) as (...args: unknown[]) => () => Promise<void>;
+    const run = createRunner(
+      agent,
+      async () => [],
+      async () => ({ wait: async () => "digest" }),
+      async () => { throw new Error("unexpected workpool"); },
+      { log: (...values: unknown[]) => logged.push(...values) },
+      () => {},
+      { hub: async () => ({ text: "", details: { jobs: [] } }) },
+    );
+
+    await run();
+
+    expect(settled).toBe(3);
+    expect(logged).toHaveLength(1);
+    const chunk = logged[0] as Record<string, unknown>;
+    expect(chunk).toMatchObject({
+      protocol: DISPLAY_PROTOCOL,
+      groupId: "tg-console",
+      transport: "omp-task-group/eval-result-view-v1",
+      chunkIndex: 0,
+      chunkCount: 1,
+    });
+    expect(typeof chunk.data).toBe("string");
+    const payload = JSON.parse(chunk.data as string) as DisplayPayload;
+    expect(payload.groupState).toBe("completed");
+    expect(payload.outcomes.map((outcome) => outcome.name).sort()).toEqual(["p0", "p1", "p2"]);
+  });
+
 });

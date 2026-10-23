@@ -412,4 +412,29 @@ describe("groupState mapping", () => {
       expect(r.cancelled).toBeUndefined();
     }
   });
+  test("decodes the structured JSON view returned by native OMP eval", () => {
+    const payload = makePayload();
+    const chunk = {
+      protocol: DISPLAY_PROTOCOL,
+      groupId: GID,
+      transport: "omp-task-group/eval-result-view-v1",
+      chunkIndex: 0,
+      chunkCount: 1,
+      data: JSON.stringify(payload),
+    };
+    const details = {
+      cells: [{
+        index: 0,
+        output: "Task Group result view",
+        views: [{ text: "Task Group result view", view: { kind: "json", value: chunk } }],
+      }],
+    };
+
+    const result = decodeResult(details);
+
+    expect(result.groupId).toBe(GID);
+    expect(outcomeOf(result, "alpha")?.result).toBe("A");
+    expect(outcomeOf(result, "beta")?.result).toBe("B");
+  });
+
 });
