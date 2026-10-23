@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { decodeDisplayGroupResult, DisplayResultError } from "../../src/backend/display-result";
+import { decodeEvalGroupResult, EvalResultError } from "../../src/backend/eval-result";
 import type { GroupRunResult, TaskOutcome } from "../../src/backend/interface";
-import { DISPLAY_PROTOCOL } from "../../src/compiler/program";
+import { EVAL_RESULT_PROTOCOL, EVAL_RESULT_TRANSPORT } from "../../src/compiler/program";
+import { isRecord } from "../../src/guards";
 import { validateSpec } from "../../src/schema/task-group";
 
 const SPEC = validateSpec({
@@ -16,6 +17,18 @@ const GID = "tg-abc";
 
 type Wire = Record<string, unknown>;
 
+
+function resultChunk(payload: Wire, chunkIndex = 0, chunkCount = 1, data?: string): Wire {
+  return {
+    protocol: EVAL_RESULT_PROTOCOL,
+    groupId: payload.groupId,
+    transport: EVAL_RESULT_TRANSPORT,
+    chunkIndex,
+    chunkCount,
+    data: data ?? JSON.stringify(payload) ?? "",
+  };
+}
+
 function outcome(name: string, over: Wire = {}): Wire {
   return { name, agent: "scout", status: "succeeded", ...over };
 }
@@ -26,7 +39,7 @@ function both(alpha: Wire, beta: Wire): Wire[] {
 
 function makePayload(over: Wire = {}): Wire {
   return {
-    protocol: DISPLAY_PROTOCOL,
+    protocol: EVAL_RESULT_PROTOCOL,
     groupId: GID,
     strategy: "fanout",
     groupState: "completed",
@@ -37,11 +50,27 @@ function makePayload(over: Wire = {}): Wire {
 }
 
 function details(entries: unknown[], extra: Wire = {}): Wire {
-  return { jsonOutputs: entries, ...extra };
+  const views: Array<{ text: string; view: { kind: "json"; value: unknown } }> = [];
+  const output: string[] = [];
+  for (const entry of entries) {
+    const value =
+      isRecord(entry) && entry.transport === EVAL_RESULT_TRANSPORT
+        ? entry
+        : isRecord(entry) && entry.protocol === EVAL_RESULT_PROTOCOL && typeof entry.groupId === "string"
+          ? resultChunk(entry)
+          : entry;
+    const text = typeof value === "string" ? value : JSON.stringify(value) ?? "null";
+    views.push({ text, view: { kind: "json", value } });
+    output.push(text);
+  }
+  return {
+    cells: [{ index: 0, output: output.join("\n"), views }],
+    ...extra,
+  };
 }
 
 function decodeResult(d: unknown = details([makePayload()])): GroupRunResult {
-  return decodeDisplayGroupResult(d, SPEC, GID);
+  return decodeEvalGroupResult(d, SPEC, GID);
 }
 
 function outcomeOf(result: GroupRunResult, name: string): TaskOutcome | undefined {
@@ -68,10 +97,10 @@ describe("payload selection", () => {
     expect(r.strategy).toBe("pool");
   });
 
-  test("tolerates foreign display values and picks the exact protocol+groupId match", () => {
+  test("ignores unrelated JSON views and selects the exact protocol and group id", () => {
     const valid = makePayload();
     const r = decodeResult(
-      details(["stray text", { protocol: "probe/v1", items: [1] }, { protocol: DISPLAY_PROTOCOL, groupId: "tg-other" }, valid]),
+      details(["stray text", { protocol: "probe/v1", items: [1] }, { protocol: EVAL_RESULT_PROTOCOL, groupId: "tg-other" }, valid]),
     );
     expect(r.groupId).toBe(GID);
     expect(outcomeOf(r, "alpha")).toBeDefined();
@@ -79,34 +108,36 @@ describe("payload selection", () => {
 
   test("selects the matching entry wherever it appears", () => {
     const valid = makePayload({ rawChildChars: 999 });
-    const r = decodeResult(details([valid, { protocol: DISPLAY_PROTOCOL, groupId: "tg-other" }]));
+    const r = decodeResult(details([valid, { protocol: EVAL_RESULT_PROTOCOL, groupId: "tg-other" }]));
     expect(r.rawChildChars).toBe(999);
   });
 
-  test("rejects duplicate protocol payloads for the same group", () => {
+  test("rejects duplicate result view chunks for one group", () => {
     const d = details([makePayload(), makePayload({ rawChildChars: 999 })]);
     expect(() => decodeResult(d)).toThrow(
-      /found 2 omp-task-group\/eval-result-v1 display payloads for group "tg-abc" \(expected exactly one\)/,
+      /found 2 eval result view chunk\(s\); expected 1/,
     );
   });
 
-  test("throws when no protocol payload exists among foreign entries", () => {
-    const d = details([{ protocol: "other/v1", groupId: GID }, { protocol: DISPLAY_PROTOCOL, groupId: "tg-z" }]);
-    expect(() => decodeResult(d)).toThrow(DisplayResultError);
+  test("does not select result views for another group id", () => {
+    const d = details([{ protocol: "other/v1", groupId: GID }, { protocol: EVAL_RESULT_PROTOCOL, groupId: "tg-z" }]);
+    expect(() => decodeResult(d)).toThrow(EvalResultError);
   });
 
-  test("empty jsonOutputs throws with a precise message", () => {
-    expect(() => decodeResult(details([]))).toThrow(/no omp-task-group\/eval-result-v1 display payload for group "tg-abc"/);
+  test("missing result view reports the expected protocol and group", () => {
+    expect(() => decodeResult(details([]))).toThrow(
+      /no omp-task-group\/eval-result-v1 JSON view for group "tg-abc"/,
+    );
   });
 
-  test("foreign-only entries name the protocols seen", () => {
+  test("foreign-only JSON views do not match the Task Group protocol", () => {
     const d = details([{ protocol: "probe/v1" }, 42]);
-    expect(() => decodeResult(d)).toThrow(/display protocols seen: probe\/v1/);
+    expect(() => decodeResult(d)).toThrow(/no omp-task-group\/eval-result-v1 JSON view/);
   });
 
   test("wrong-group payload throws naming found group ids", () => {
     const d = details([makePayload({ groupId: "tg-other" })]);
-    expect(() => decodeResult(d)).toThrow(/found 1 omp-task-group\/eval-result-v1 display payload\(s\) but none for group "tg-abc"/);
+    expect(() => decodeResult(d)).toThrow(/no omp-task-group\/eval-result-v1 JSON view for group "tg-abc"/);
     expect(() => decodeResult(d)).toThrow(/group ids seen: tg-other/);
   });
 });
@@ -116,20 +147,19 @@ describe("malformed details", () => {
     for (const d of [null, "x", 42, []]) {
       expect(() => decodeResult(d)).toThrow(/details are not an object/);
     }
-    expect(() => decodeDisplayGroupResult(undefined, SPEC, GID)).toThrow(/details are not an object/);
+    expect(() => decodeEvalGroupResult(undefined, SPEC, GID)).toThrow(/details are not an object/);
   });
-  test("jsonOutputs must be an array", () => {
-    for (const d of [details([], { jsonOutputs: undefined }), { jsonOutputs: "nope" }, { jsonOutputs: {} }]) {
-      expect(() => decodeResult(d)).toThrow(/jsonOutputs is missing or not an array/);
+  test("native eval details must contain cells", () => {
+    for (const d of [{ cells: undefined }, { cells: "nope" }, { cells: {} }]) {
+      expect(() => decodeResult(d)).toThrow(/eval result details.cells is missing or not an array/);
     }
   });
 
   test("truthy details.async is a barrier violation and beats payload presence", () => {
     const withPayload = details([makePayload()], { async: { state: "running", jobId: "bg_1", type: "eval" } });
     expect(() => decodeResult(withPayload)).toThrow(/eval cell auto-backgrounded/);
-    expect(() => decodeResult(withPayload)).toThrow(DisplayResultError);
-    // async is checked before payload selection — an empty jsonOutputs still
-    // reports the barrier, never a misleading "no payload" error.
+    expect(() => decodeResult(withPayload)).toThrow(EvalResultError);
+    // async is checked before view selection — report the barrier, not a missing result.
     expect(() => decodeResult(details([], { async: true }))).toThrow(/auto-backgrounded/);
   });
 
@@ -140,7 +170,7 @@ describe("malformed details", () => {
     }
   });
 
-  test("all decode failures are DisplayResultError instances", () => {
+  test("all decode failures are EvalResultError instances", () => {
     const cases: unknown[] = [
       null,
       details([]),
@@ -153,8 +183,8 @@ describe("malformed details", () => {
         decodeResult(d);
         expect.unreachable();
       } catch (e) {
-        expect(e).toBeInstanceOf(DisplayResultError);
-        expect((e as Error).name).toBe("DisplayResultError");
+        expect(e).toBeInstanceOf(EvalResultError);
+        expect((e as Error).name).toBe("EvalResultError");
       }
     }
   });
@@ -412,4 +442,38 @@ describe("groupState mapping", () => {
       expect(r.cancelled).toBeUndefined();
     }
   });
+  test("reassembles out-of-order OMP JSON view chunks", () => {
+    const payload = makePayload({ rawChildChars: 999 });
+    const serialized = JSON.stringify(payload);
+    const midpoint = Math.floor(serialized.length / 2);
+    const chunks = [
+      resultChunk(payload, 1, 2, serialized.slice(midpoint)),
+      resultChunk(payload, 0, 2, serialized.slice(0, midpoint)),
+    ];
+
+    const result = decodeResult(details(chunks));
+
+    expect(result.rawChildChars).toBe(999);
+    expect(outcomeOf(result, "alpha")?.result).toBe("A");
+  });
+
+  test("rejects incomplete, duplicate, and oversized result view sets", () => {
+    const payload = makePayload();
+    const serialized = JSON.stringify(payload);
+    const midpoint = Math.floor(serialized.length / 2);
+    const first = resultChunk(payload, 0, 2, serialized.slice(0, midpoint));
+    const duplicateIndex = resultChunk(payload, 0, 2, serialized.slice(midpoint));
+    const overflow = {
+      protocol: EVAL_RESULT_PROTOCOL,
+      groupId: GID,
+      transport: EVAL_RESULT_TRANSPORT,
+      overflow: true,
+      chunkCount: 17,
+    };
+
+    expect(() => decodeResult(details([first]))).toThrow(/found 1 eval result view chunk\(s\); expected 2/);
+    expect(() => decodeResult(details([first, duplicateIndex]))).toThrow(/duplicate eval result view chunk at index 0/);
+    expect(() => decodeResult(details([overflow]))).toThrow(/exceeds OMP's structured-view capacity/);
+  });
+
 });

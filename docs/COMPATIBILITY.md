@@ -1,8 +1,8 @@
 # omp-task-group — Compatibility
 
-Target: OMP (oh-my-pi) v18.1.x — docs sources: `docs/extensions.md`,
-`docs/tools/eval.md`, `docs/tools/hub.md`, `docs/tui.md`, `docs/sdk.md`,
-`docs/extension-loading.md` at tag v18.1.x of can1357/oh-my-pi.
+Target: OMP (oh-my-pi) v18.12.1 — eval contract source: `docs/tools/eval.md`
+and `packages/coding-agent/src/eval/js/shared/runtime.ts` at tag v18.12.1 of
+can1357/oh-my-pi.
 
 ## Public surfaces consumed
 
@@ -12,11 +12,11 @@ Target: OMP (oh-my-pi) v18.1.x — docs sources: `docs/extensions.md`,
 | `pi.on("tool_call")` returning `{ input }` | rewrites valid envelope input | input is revalidated by the active eval owner |
 | `pi.on("tool_call")` returning `{ block, reason }` | blocks a recognized malformed envelope | never executes it as ordinary JS |
 | `pi.on("tool_result")` returning a patch | replaces final content/details/isError | only after exact wire-protocol decode |
-| native `details.jsonOutputs` | full `display()` value | sole final result decoder source |
+| native eval JSON views | `console.log()` JSON values at `details.cells[].views[].view.value` | exact protocol, transport, group id, and complete chunk coverage |
 | `before_agent_start` return `{systemPrompt}` | REPLACE system prompt | Array.isArray guard |
 | `ctx.ui.notify(text, level?)` | notification string | `/task-group` command only |
 | `ctx.abort()` | abort current operation | collision at tool execution start |
-| eval prelude `agent/wait/completion/workpool/display/phase/tool.hub` | documented helpers | no private runtime import |
+| eval prelude `agent/wait/completion/workpool/console.log/phase/tool.hub` | documented helpers | no private runtime import |
 | `workpool` aggregate text format | `- [key] status` + fenced block | tolerant parser + fallback |
 | session entries via `pi.appendEntry` | package-qualified type | telemetry persistence |
 | `ctx.sessionManager.getBranch()` | read-only branch | telemetry rehydrate |
@@ -31,9 +31,8 @@ order irrelevant and ordinary-eval approvals (smart-approve) untouched.
 - Grammar: `WS* ompTaskGroup(<strict JSON>) WS* ;? WS* EOF`. Outer whitespace and one
   optional terminal semicolon are allowed; nothing else. No arbitrary JavaScript.
 - Valid envelope → `tool_call` rewrites the input so the cell runs the compiled
-  group program; `tool_result` decodes `details.jsonOutputs` and finalizes the
-  result with stable snapshot details
-  (`{ protocol: "omp-task-group/v1", snapshot, gate, ... }`).
+  group program; `tool_result` decodes OMP JSON views and finalizes the result
+  with stable snapshot details (`{ protocol: "omp-task-group/v1", snapshot, gate, ... }`).
 - Recognized-but-malformed envelope → `{ block: true, reason }`: distinguishable
   from a non-envelope, never executed as ordinary JS.
 - Non-envelope eval calls are untouched and are not claimed as plugin-owned.
@@ -55,17 +54,26 @@ order irrelevant and ordinary-eval approvals (smart-approve) untouched.
 - No private modules (`task/structured-subagent`, `AsyncJobManager`, …) — guarded.
 - No `registerTool("eval")` / `ctx.invokeTool` — native eval is never shadowed.
 
-## Verified empirically / confirmed contracts (OMP v18.1.x)
+## Current eval result contract (OMP v18.12.1)
 
-- eval `wait()` consumes child deliveries in-cell (no re-delivery wake).
-- workpool aggregate delivery recovered exactly once via `hub wait`.
-- 10-child live group: single continuation, zero child wakes.
-- `agent()` preflight errors throw synchronously; unknown agent fails fast.
-- handle `.status` is a property (py) / function (js); `.done()` promise-like.
-- `display()`'s full value lands in native `details.jsonOutputs`; a native result
-  with `details.async` marks a steering-triggered auto-background, which is
-  decoded fail-closed as a barrier violation (configured auto-background is a
-  hard block; no degraded opt-in).
+- JavaScript eval exposes `console.log()` but no `display()` global.
+- The eval result uses `details.cells[]`; JSON views carry structured values at
+  `cells[].views[].view.value`.
+- OMP retains at most 16 JSON views per cell and drops a view over 32 KiB.
+  The compiler emits 14,000-character chunks and fails closed beyond 16 chunks.
+- `details.async` marks a steering-triggered auto-background; Task Group rejects
+  it because the result is not final.
+
+## Historical live integration evidence (OMP v18.1.x)
+
+- `wait()` consumed child deliveries in-cell; workpool aggregate delivery was
+  recovered exactly once via `hub wait`.
+- A 10-child live group produced one continuation and zero child wakes.
+- `agent()` preflight errors threw synchronously; unknown agents failed fast.
+- Handle `.status` was a property in Python and a function in JavaScript;
+  `.done()` was promise-like.
+- These live observations were collected on v18.1.x; the current wire transport
+  is based on the v18.12.1 eval contract above.
 
 ## Not supported (non-goals)
 

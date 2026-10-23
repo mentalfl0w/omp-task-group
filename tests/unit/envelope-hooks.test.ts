@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import taskGroupExtension from "../../src/index";
-import { DISPLAY_PROTOCOL } from "../../src/compiler/program";
+import { EVAL_RESULT_PROTOCOL, EVAL_RESULT_TRANSPORT } from "../../src/compiler/program";
 import type { ExtensionAPI, ExtensionContext } from "../../src/types";
 
 const SPEC = {
@@ -131,7 +131,7 @@ describe("standard eval envelope hooks", () => {
   test("does not register eval and leaves ordinary eval unchanged", async () => {
     await withIsolatedHarness(async (harness) => {
       expect(harness.registeredTools).toEqual([]);
-      const result = await emit(harness, "tool_call", evalCall("normal", "const x = 1 + 1; display(x)"));
+      const result = await emit(harness, "tool_call", evalCall("normal", "const x = 1 + 1; console.log(x)"));
       expect(result).toBeUndefined();
     });
   });
@@ -145,14 +145,14 @@ describe("standard eval envelope hooks", () => {
     });
   });
 
-  test("rewrites a valid envelope and finalizes its native display payload", async () => {
+  test("rewrites a valid envelope and finalizes its native OMP JSON view", async () => {
     await withIsolatedHarness(async (harness) => {
       const rewrite = await emit(harness, "tool_call", evalCall("group", envelope()));
       const input = rewrittenInput(rewrite);
       expect(input.language).toBe("js");
       expect(input.timeout).toBe(0);
       expect(typeof input.code).toBe("string");
-      expect(String(input.code)).toContain(DISPLAY_PROTOCOL);
+      expect(String(input.code)).toContain(EVAL_RESULT_PROTOCOL);
       expect(String(input.code)).not.toContain("ompTaskGroup(");
       const groupId = groupIdFrom(input);
 
@@ -165,7 +165,7 @@ describe("standard eval envelope hooks", () => {
       expect(harness.state.aborts).toBe(0);
 
       const wireResult = {
-        protocol: DISPLAY_PROTOCOL,
+        protocol: EVAL_RESULT_PROTOCOL,
         groupId,
         strategy: "fanout",
         groupState: "completed",
@@ -175,13 +175,28 @@ describe("standard eval envelope hooks", () => {
           { name: "beta", agent: "sonic", status: "succeeded", handle: `agent://${groupId}-beta`, durationMs: 11, result: "beta" },
         ],
       };
+      const resultChunk = {
+        protocol: EVAL_RESULT_PROTOCOL,
+        groupId,
+        transport: EVAL_RESULT_TRANSPORT,
+        chunkIndex: 0,
+        chunkCount: 1,
+        data: JSON.stringify(wireResult),
+      };
+      const output = JSON.stringify(resultChunk);
       const patch = await emit(harness, "tool_result", {
         type: "tool_result",
         toolCallId: "group",
         toolName: "eval",
         input,
-        content: [{ type: "text", text: "native display JSON" }],
-        details: { jsonOutputs: [wireResult] },
+        content: [{ type: "text", text: output }],
+        details: {
+          cells: [{
+            index: 0,
+            output,
+            views: [{ text: output, view: { kind: "json", value: resultChunk } }],
+          }],
+        },
         isError: false,
       });
       expect(isRecord(patch)).toBe(true);
@@ -206,14 +221,14 @@ describe("standard eval envelope hooks", () => {
         type: "tool_execution_start",
         toolCallId: "collision",
         toolName: "eval",
-        args: { ...input, code: "display('other extension code')" },
+        args: { ...input, code: "console.log('other extension code')" },
       });
       expect(harness.state.aborts).toBe(1);
       const patch = await emit(harness, "tool_result", {
         type: "tool_result",
         toolCallId: "collision",
         toolName: "eval",
-        input: { ...input, code: "display('other extension code')" },
+        input: { ...input, code: "console.log('other extension code')" },
         content: [],
         details: {},
         isError: true,

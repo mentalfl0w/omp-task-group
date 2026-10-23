@@ -4,7 +4,7 @@
 independent subagents, join, and return **exactly one logical result** to the parent.
 Not a workflow engine: no DAG, no `depends_on`, no pipeline, no loop, no resume.
 
-Works with the installed `omp` (v18.x). Zero runtime dependencies; public API only.
+Works with OMP v18.12.x. Zero runtime dependencies; public API only.
 
 ## What it does
 
@@ -152,9 +152,9 @@ stream** and no custom widget/RPC snapshot channel.
 
 - Content: the bounded text digest — per-task status, clipped preview, duration +
   model, `agent://` handle for the full transcript.
-- Details: the stable snapshot shape `{ protocol: "omp-task-group/v1", snapshot,
-  gate, ... }` on the final result (decoded from the eval wire payload — never raw
-  `jsonOutputs`).
+- Details: the final result carries the stable snapshot shape `{ protocol: "omp-task-group/v1", snapshot,
+  gate, ... }`. The hook decodes OMP's native `cells[].views[].view.value` transport
+  and does not leak the per-cell view chunks.
 - Plain/headless and TUI/RPC modes receive identical final content/details.
 
 ## Architecture
@@ -165,10 +165,9 @@ See `docs/ARCHITECTURE.md`. Highlights:
   `ompTaskGroup(<strict JSON>)`. The plugin never shadows `eval`; a `tool_call`
   hook recognizes the envelope (rewriting the cell to run the compiled group
   program) and a `tool_result` hook finalizes the result.
-- **Compiled program** uses only the public eval prelude (`agent / wait / workpool /
-  completion / display / print`) and calls `display()` exactly once with the wire
-  protocol `omp-task-group/eval-result-v1`; the finalizer decodes it from native
-  `details.jsonOutputs` back into the stable snapshot details.
+- **Compiled program** uses the public JS eval prelude and emits protocol-tagged
+  JSON chunks through `console.log()`. The finalizer reassembles them from
+  `details.cells[].views[].view.value` into the stable snapshot details.
 - **One state reducer** → one snapshot protocol (`omp-task-group/v1`); every text
   and detail consumer reads only that final snapshot.
 - **Private-API import guard**: CI fails if any source file imports OMP internals
@@ -185,9 +184,9 @@ bun run lint:private-api
 bun run build
 ```
 
-## Known limits (v0.1)
+## Known limits
 
-- Per-child token counts are not exposed by OMP's public surface in 18.1.x;
+- Per-child token counts are not exposed by OMP v18.12.x's public eval surface;
   snapshots carry `null` tokens and budget-delta estimates in telemetry.
 - No live per-task stream: the parent sees one final tool result. Output lines the
   native eval cell may show while a group runs are ordinary cell output, not Task
