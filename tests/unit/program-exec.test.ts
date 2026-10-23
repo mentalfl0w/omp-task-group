@@ -1,15 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { compileFanoutProgram, compilePoolProgram, DISPLAY_PROTOCOL } from "../../src/compiler/program";
+import { compileFanoutProgram, compilePoolProgram, EVAL_RESULT_PROTOCOL, EVAL_RESULT_TRANSPORT } from "../../src/compiler/program";
 import { validateSpec } from "../../src/schema/task-group";
 import type { TaskGroupSpec } from "../../src/schema/task-group";
 
 /**
- * Executable transport test: run the compiled program inside a MOCKED eval
- * kernel (public-prelude-shaped stubs: agent / wait / completion / workpool /
- * display / phase / tool.hub) and verify the single structured display()
- * result end-to-end — protocol payload, inline per-task results, clipping,
- * join/cancel semantics. This is the test class that catches program-level
- * crashes that syntax checks cannot see (e.g. a lost declaration).
+ * Executable transport test: run the compiled program inside a mocked OMP eval
+ * kernel (agent / wait / completion / workpool / console.log / phase /
+ * tool.hub) and verify the JSON-view result end-to-end: protocol, inline
+ * outcomes, clipping, join/cancel semantics, and pool recovery.
  */
 
 interface Outcome {
@@ -24,7 +22,7 @@ interface Outcome {
   error?: string;
 }
 
-interface DisplayPayload {
+interface TaskGroupResultPayload {
   protocol: string;
   groupId: string;
   strategy: string;
@@ -37,7 +35,7 @@ interface DisplayPayload {
 }
 
 interface MockKernel {
-  displays: unknown[];
+  consoleValues: unknown[];
   phases: string[];
   completionPrompts: string[];
   run(program: string): Promise<void>;
@@ -45,27 +43,29 @@ interface MockKernel {
 
 type FnMap = Record<string, unknown>;
 
-/** Execute a compiled program inside an arbitrary prelude fn map. */
+/** Execute a compiled program inside an OMP-shaped prelude. */
 function installRunner(kernel: MockKernel, fns: FnMap): void {
-  fns.display = (value: unknown) => {
-    kernel.displays.push(value);
+  fns.console = {
+    log: (...values: unknown[]) => {
+      kernel.consoleValues.push(...values);
+    },
   };
   fns.phase = (title: string) => {
     kernel.phases.push(String(title));
   };
   kernel.run = (program: string) => {
     const fn = new Function(
-      "agent", "wait", "completion", "workpool", "display", "phase", "tool",
+      "agent", "wait", "completion", "workpool", "console", "phase", "tool",
       `return async () => {\n${program}\n}`,
     ) as (...args: unknown[]) => () => Promise<void>;
-    const runner = fn(fns.agent, fns.wait, fns.completion, fns.workpool, fns.display, fns.phase, fns.tool);
+    const runner = fn(fns.agent, fns.wait, fns.completion, fns.workpool, fns.console, fns.phase, fns.tool);
     return runner();
   };
 }
 
-/** Assemble a mocked prelude and execute one compiled program inside it. */
+/** Assemble an OMP-shaped prelude and execute one compiled program inside it. */
 function makeKernel(results: Array<unknown>): MockKernel {
-  const kernel: MockKernel = { displays: [], phases: [], completionPrompts: [], run: async () => {} };
+  const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
   const fns: FnMap = {};
   // Sequential result consumption keyed by spawn order, mirroring the real
   // agent() handle wait contract (wait() resolves the child's result).
@@ -96,12 +96,51 @@ function makeKernel(results: Array<unknown>): MockKernel {
   return kernel;
 }
 
-function lastDisplay(kernel: MockKernel): DisplayPayload {
-  expect(kernel.displays).toHaveLength(1);
-  return kernel.displays[0] as DisplayPayload;
+function lastEvalPayload(kernel: MockKernel): TaskGroupResultPayload {
+  const chunks = [...kernel.consoleValues] as Array<Record<string, unknown>>;
+  expect(chunks.length).toBeGreaterThan(0);
+  const rawCount = chunks[0]?.chunkCount;
+  expect(typeof rawCount).toBe("number");
+  const count = rawCount as number;
+  expect(Number.isInteger(count)).toBe(true);
+  expect(count).toBeLessThanOrEqual(16);
+  expect(chunks).toHaveLength(count);
+
+  const ordered: Array<Record<string, unknown> | undefined> = new Array(count);
+  for (const chunk of chunks) {
+    const index = chunk.chunkIndex;
+    expect(typeof index).toBe("number");
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= count) {
+      throw new Error(`invalid result chunk index: ${String(index)}`);
+    }
+    expect(ordered[index]).toBeUndefined();
+    ordered[index] = chunk;
+  }
+
+  let serialized = "";
+  for (let index = 0; index < ordered.length; index++) {
+    const chunk = ordered[index];
+    expect(chunk).toBeDefined();
+    if (chunk === undefined) throw new Error(`missing result chunk ${index}`);
+    expect(chunk).toMatchObject({
+      protocol: EVAL_RESULT_PROTOCOL,
+      transport: EVAL_RESULT_TRANSPORT,
+      chunkIndex: index,
+      chunkCount: count,
+    });
+    const data = chunk.data;
+    expect(typeof data).toBe("string");
+    if (typeof data !== "string") throw new Error(`result chunk ${index} data is not text`);
+    const encodedView = JSON.stringify({ kind: "json", value: chunk });
+    if (encodedView === undefined) throw new Error(`result chunk ${index} is not JSON serializable`);
+    expect(encodedView.length).toBeLessThanOrEqual(32 * 1024);
+    serialized += data;
+  }
+  return JSON.parse(serialized) as TaskGroupResultPayload;
 }
 
-function byName(payload: DisplayPayload, name: string): Outcome {
+
+function byName(payload: TaskGroupResultPayload, name: string): Outcome {
   const o = payload.outcomes.find((x) => x.name === name);
   expect(o).toBeDefined();
   return o as Outcome;
@@ -129,10 +168,10 @@ const SPEC3 = validateSpec({
 });
 
 describe("compiled program execution (mocked kernel)", () => {
-  test("fanout all+collect: single display() with the full structured payload", async () => {
+  test("fanout all+collect returns one result containing every task outcome", async () => {
     const { kernel } = await runFanout(SPEC3, "tg-exec", ["res-0", "res-1", "res-2"]);
-    const payload = lastDisplay(kernel);
-    expect(payload.protocol).toBe(DISPLAY_PROTOCOL);
+    const payload = lastEvalPayload(kernel);
+    expect(payload.protocol).toBe(EVAL_RESULT_PROTOCOL);
     expect(payload.groupId).toBe("tg-exec");
     expect(payload.strategy).toBe("fanout");
     expect(payload.groupState).toBe("completed");
@@ -167,7 +206,7 @@ describe("compiled program execution (mocked kernel)", () => {
   test("structured child values ride inline in outcomes", async () => {
     const obj = { verdict: "ok", scores: [1, 2, 3] };
     const { kernel } = await runFanout(SPEC3, "tg-str", [obj, "text-1", "text-2"]);
-    const payload = lastDisplay(kernel);
+    const payload = lastEvalPayload(kernel);
     expect(payload.groupState).toBe("completed");
     const o = byName(payload, "p0");
     expect(o.status).toBe("succeeded");
@@ -188,7 +227,7 @@ describe("compiled program execution (mocked kernel)", () => {
     });
     const huge = { payload: "z".repeat(300) };
     const { kernel } = await runFanout(spec, "tg-clip", ["x".repeat(400), huge]);
-    const payload = lastDisplay(kernel);
+    const payload = lastEvalPayload(kernel);
     const s = byName(payload, "big-string");
     expect(s.status).toBe("succeeded");
     expect(s.result?.startsWith("x".repeat(100))).toBe(true);
@@ -212,7 +251,7 @@ describe("compiled program execution (mocked kernel)", () => {
       ],
     });
     const program = compileFanoutProgram(spec, { groupId: "tg-any" });
-    const kernel: MockKernel = { displays: [], phases: [], completionPrompts: [], run: async () => {} };
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
     const cancelled: string[] = [];
     let slowResolve: ((value: unknown) => void) | undefined;
     const agent = async (_p: string, opts: { label: string }) => ({
@@ -241,7 +280,7 @@ describe("compiled program execution (mocked kernel)", () => {
     };
     installRunner(kernel, fns);
     await kernel.run(program);
-    const payload = lastDisplay(kernel);
+    const payload = lastEvalPayload(kernel);
     expect(payload.groupState).toBe("completed");
     expect(payload.outcomes).toHaveLength(2);
     const fast = byName(payload, "fast");
@@ -255,7 +294,7 @@ describe("compiled program execution (mocked kernel)", () => {
 
   test("failures classify as failed/cancelled with errors, group completes (collect)", async () => {
     const { kernel } = await runFanout(SPEC3, "tg-fail", ["fine", new Error("boom-1"), new Error("cancel: interrupted")]);
-    const payload = lastDisplay(kernel);
+    const payload = lastEvalPayload(kernel);
     expect(payload.groupState).toBe("completed"); // collect: ≥1 success
     expect(byName(payload, "p0").status).toBe("succeeded");
     const failed = byName(payload, "p1");
@@ -276,7 +315,7 @@ describe("compiled program execution (mocked kernel)", () => {
     const { kernel } = await runFanout(spec, "tg-sum", ["alpha-res", "beta-res", "gamma-res"], {
       summarize: { model: "smol" },
     });
-    const payload = lastDisplay(kernel);
+    const payload = lastEvalPayload(kernel);
     expect(payload.summary).toBe("digest-mock");
     expect(payload.summaryError).toBeUndefined();
     expect(kernel.phases).toContain("summarizing");
@@ -300,7 +339,7 @@ describe("compiled program execution (mocked kernel)", () => {
       ],
     });
     const program = compilePoolProgram(spec, { groupId: "tg-pool" });
-    const kernel: MockKernel = { displays: [], phases: [], completionPrompts: [], run: async () => {} };
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
     const aggregateText = [
       "Pool `tg-pool` completed — 6/6 items.",
       ...spec.tasks.map((_t, i) => `- [tg-pool#${i + 1}] completed — task ${i}\n\`\`\`json\n{"tg-pool#${i + 1}":"pool-res-${i}"}\n\`\`\``),
@@ -326,8 +365,8 @@ describe("compiled program execution (mocked kernel)", () => {
     };
     installRunner(kernel, fns);
     await kernel.run(program);
-    const payload = lastDisplay(kernel);
-    expect(payload.protocol).toBe(DISPLAY_PROTOCOL);
+    const payload = lastEvalPayload(kernel);
+    expect(payload.protocol).toBe(EVAL_RESULT_PROTOCOL);
     expect(payload.groupId).toBe("tg-pool");
     expect(payload.strategy).toBe("pool");
     expect(payload.groupState).toBe("completed");
@@ -374,16 +413,32 @@ describe("compiled program execution (mocked kernel)", () => {
     expect(logged).toHaveLength(1);
     const chunk = logged[0] as Record<string, unknown>;
     expect(chunk).toMatchObject({
-      protocol: DISPLAY_PROTOCOL,
+      protocol: EVAL_RESULT_PROTOCOL,
       groupId: "tg-console",
-      transport: "omp-task-group/eval-result-view-v1",
+      transport: EVAL_RESULT_TRANSPORT,
       chunkIndex: 0,
       chunkCount: 1,
     });
     expect(typeof chunk.data).toBe("string");
-    const payload = JSON.parse(chunk.data as string) as DisplayPayload;
+    const payload = JSON.parse(chunk.data as string) as TaskGroupResultPayload;
     expect(payload.groupState).toBe("completed");
     expect(payload.outcomes.map((outcome) => outcome.name).sort()).toEqual(["p0", "p1", "p2"]);
+  });
+
+  test("large child output survives chunking across OMP JSON views", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      output: { mode: "compact", perTaskChars: 20_000, maxTotalChars: 50_000, preserveHandles: true },
+      tasks: [
+        { name: "large", agent: "sonic", task: "Large" },
+        { name: "small", agent: "sonic", task: "Small" },
+      ],
+    });
+    const largeResult = '"'.repeat(16_000);
+    const { kernel } = await runFanout(spec, "tg-chunked", [largeResult, "small"]);
+
+    expect(kernel.consoleValues.length).toBeGreaterThan(1);
+    expect(byName(lastEvalPayload(kernel), "large").result).toBe(largeResult);
   });
 
 });

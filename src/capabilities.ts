@@ -42,7 +42,7 @@ export function probeCapabilities(ctx: ExtensionContext | undefined, config: Tas
   rows.push({
     name: "eval-envelope",
     ok: true,
-    note: "standard eval code envelope ompTaskGroup(<strict JSON>); recognized via tool_call (input rewrite) and finalized via tool_result (details.jsonOutputs) — eval is not shadowed",
+    note: "standard eval envelope ompTaskGroup(<strict JSON>); recognized via tool_call (input rewrite) and finalized via tool_result JSON views — eval is not shadowed",
   });
   rows.push({
     name: "snapshot-details",

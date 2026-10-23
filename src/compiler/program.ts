@@ -1,39 +1,20 @@
 /**
  * omp-task-group — Task Group compiler.
  *
- * Compiles a validated TaskGroupSpec into a SELF-CONTAINED JavaScript eval
- * program that uses ONLY the public eval prelude:
- *   agent() / wait() / workpool() / completion() / display() / phase() /
- *   tool.hub(...)
+ * Compiles a validated TaskGroupSpec into a self-contained JavaScript eval
+ * program using only OMP's public eval prelude:
+ * agent(), wait(), workpool(), completion(), console.log(), phase(), tool.hub().
  *
- * The program runs inside the native eval kernel. It never imports anything,
- * never touches host internals, and never prints a marker protocol. Results
- * travel on ONE structured channel: the program calls display() exactly once
- * with the final group payload. The native eval tool captures the full
- * structured value in details.jsonOutputs (model-visible text is capped, the
- * jsonOutputs copy is not) — that details object is the whole transport
- * between the kernel and the engine. phase() is used only for coarse native
- * status events (task transitions, pool drain, summarizing).
+ * OMP eval has no display() global. The program emits protocol-tagged JSON
+ * chunks as console.log() objects; OMP exposes their JSON views through
+ * details.cells[].views[].view.value. Chunks stay below OMP's documented
+ * per-cell view count and size limits. Stdout text is not a result channel.
  *
- * Display payload shape (protocol DISPLAY_PROTOCOL, "omp-task-group/eval-result-v1"):
- *   {
- *     protocol:      "omp-task-group/eval-result-v1",
- *     groupId,                    // string
- *     strategy,                   // "fanout" | "pool"
- *     groupState,                 // "completed" | "failed" (authoritative)
- *     rawChildChars,              // number: pre-clip child output chars
- *     outcomes,                   // per-task records, inline results (below)
- *     groupError?,                // only when defined (fanout maxGroupMs guard)
- *     summary?, summaryError?,    // only when defined (summarize mode)
- *   }
- * Outcome record: { name, agent, status, handle?, durationMs?,
- *   resolvedModel?, result?, structured?, error? }; keys are ABSENT when
- * unset. status ∈ "succeeded" | "failed" | "cancelled". Per-task success
- * content is carried INLINE — there is no side channel for results:
- *   - string successes   → result, clipped to output.perTaskChars
- *   - other JSON values  → structured, kept verbatim when its JSON form fits
- *     output.perTaskChars, otherwise degraded to a clipped JSON text in result
- *   - failed/cancelled   → error
+ * Wire payload: { protocol, groupId, strategy, groupState, rawChildChars,
+ * outcomes, groupError?, summary?, summaryError? }. Each outcome carries
+ * name, agent, status, and optional handle, durationMs, resolvedModel,
+ * result, structured, or error. Child content is clipped to
+ * output.perTaskChars before it enters the wire payload.
  *
  * Join semantics (per-handle waits are consumed exactly once — that is what
  * suppresses per-child parent wakes):
@@ -54,8 +35,14 @@ export interface CompileOptions {
   maxGroupMs?: number;
 }
 
-/** Shared display() result protocol — decoder contract (omp-task-group/eval-result-v1). */
-export const DISPLAY_PROTOCOL = "omp-task-group/eval-result-v1";
+/** Stable wire payload protocol shared by compiler and result decoder. */
+export const EVAL_RESULT_PROTOCOL = "omp-task-group/eval-result-v1";
+/** Identifies result chunks carried as OMP eval JSON views. */
+export const EVAL_RESULT_TRANSPORT = "omp-task-group/eval-result-view-v1";
+/** Keeps a double-escaped JSON view under OMP's 32 KiB per-view limit. */
+export const EVAL_RESULT_CHUNK_CHARS = 14_000;
+/** OMP v18.12 retains at most 16 JSON views per eval cell. */
+export const EVAL_RESULT_MAX_CHUNKS = 16;
 
 function embedJson(value: unknown): string {
   // Double encoding: the JSON.parse argument is itself a JSON string literal,
@@ -67,7 +54,10 @@ function sharedPrelude(spec: TaskGroupSpec, opts: CompileOptions): string {
   return `
 const TG_SPEC = ${embedJson(spec)};
 const TG_GROUP = ${JSON.stringify(opts.groupId)};
-const TG_PROTOCOL = ${JSON.stringify(DISPLAY_PROTOCOL)};
+const TG_PROTOCOL = ${JSON.stringify(EVAL_RESULT_PROTOCOL)};
+const TG_RESULT_TRANSPORT = ${JSON.stringify(EVAL_RESULT_TRANSPORT)};
+const TG_RESULT_CHUNK_CHARS = ${EVAL_RESULT_CHUNK_CHARS};
+const TG_RESULT_MAX_CHUNKS = ${EVAL_RESULT_MAX_CHUNKS};
 const TG_SUMMARIZE = ${JSON.stringify(opts.summarize ?? null)};
 const TG_MAX_MS = ${JSON.stringify(opts.maxGroupMs ?? 3_600_000)};
 const tgStart = Date.now();
@@ -148,7 +138,7 @@ function tgWaitFor(t, handlePromise) {
 }
 `.trimStart();
 
-// The ONE display() call per program: the full structured group result.
+// Shared native eval finalizer. JSON chunks travel through OMP console views.
 const ENRICH_AND_FINALIZE = `
 async function tgEnrichFromHub() {
   try {
@@ -184,7 +174,32 @@ function tgFinalize(groupState, extra) {
   if (extra.groupError !== undefined) payload.groupError = extra.groupError;
   if (extra.summary !== undefined) payload.summary = extra.summary;
   if (extra.summaryError !== undefined) payload.summaryError = extra.summaryError;
-  display(payload);
+  tgEmitResult(payload);
+}
+function tgEmitResult(payload) {
+  const data = JSON.stringify(payload);
+  const chunkCount = Math.max(1, Math.ceil(data.length / TG_RESULT_CHUNK_CHARS));
+  if (chunkCount > TG_RESULT_MAX_CHUNKS) {
+    console.log({
+      protocol: TG_PROTOCOL,
+      groupId: TG_GROUP,
+      transport: TG_RESULT_TRANSPORT,
+      overflow: true,
+      chunkCount,
+      serializedChars: data.length,
+    });
+    return;
+  }
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
+    console.log({
+      protocol: TG_PROTOCOL,
+      groupId: TG_GROUP,
+      transport: TG_RESULT_TRANSPORT,
+      chunkIndex,
+      chunkCount,
+      data: data.slice(chunkIndex * TG_RESULT_CHUNK_CHARS, (chunkIndex + 1) * TG_RESULT_CHUNK_CHARS),
+    });
+  }
 }
 async function tgMaybeSummarize(extra) {
   if (TG_SPEC.output.mode !== "summarize" || !TG_SUMMARIZE || extra.groupState !== "completed") return;

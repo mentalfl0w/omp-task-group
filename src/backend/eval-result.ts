@@ -1,41 +1,29 @@
 /**
- * omp-task-group — native eval display-result decoder.
+ * omp-task-group — native eval result decoder.
  *
- * Envelope finalization receives the COMPLETED native eval tool result. Its
- * details.jsonOutputs array holds the RAW values passed to the eval prelude's
- * display(); the compiled group program (src/compiler/program.ts) calls
- * display() exactly once with the protocol payload. This module is the
- * compiler's inverse: it locates that payload among any foreign display
- * values, validates it against the spec and the expected group id, and
- * produces the engine's GroupRunResult. It knows nothing about presentation
- * and never touches host internals.
+ * OMP JS eval exposes `console.log()` and stores JSON views in
+ * details.cells[].views[].view.value. The compiler emits bounded chunks with
+ * an exact protocol and group id; this module reassembles and validates the
+ * wire payload before it reaches the Task Group engine.
  *
- * Fail-closed rules (never guess, never return partial success):
- *  - a truthy details.async (cell auto-backgrounded) is a barrier violation:
- *    the envelope tool_result handler reports it before decode; this module
- *    throws as a defensive backstop.
- *  - protocol + groupId must match EXACTLY; foreign display() values in the
- *    same kernel are tolerated but never mixed in.
- *  - outcome names must cover the spec's task names exactly once each;
- *    unknown names, unknown statuses and mistyped optional fields throw.
- *  - wire groupState is authoritative: "completed" is a clean result,
- *    "failed" yields a descriptive groupError when the wire omitted one,
- *    "cancelled" surfaces as GroupRunResult.cancelled (defensive — the
- *    compiler never emits group-level "cancelled" today).
- *  - explicit groupError/summary survive untouched. A summaryError without
- *    groupError folds into groupError ("summarizer failed: …") — the only
- *    GroupRunResult field able to carry it.
+ * Fail closed: reject backgrounded cells, missing/foreign/duplicate chunks,
+ * malformed JSON, and task sets that do not exactly match the requested spec.
  */
-import { DISPLAY_PROTOCOL } from "../compiler/program";
+import {
+  EVAL_RESULT_CHUNK_CHARS,
+  EVAL_RESULT_MAX_CHUNKS,
+  EVAL_RESULT_PROTOCOL,
+  EVAL_RESULT_TRANSPORT,
+} from "../compiler/program";
 import type { GroupRunResult, TaskOutcome } from "./interface";
 import type { TaskGroupSpec } from "../schema/task-group";
 import { isRecord } from "../guards";
 
 /** Thrown when an eval result cannot be decoded into a valid group result. */
-export class DisplayResultError extends Error {
+export class EvalResultError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "DisplayResultError";
+    this.name = "EvalResultError";
   }
 }
 
@@ -44,78 +32,127 @@ const TASK_STATUSES: Record<string, true> = { succeeded: true, failed: true, can
 const GROUP_STATES: Record<string, true> = { completed: true, failed: true, cancelled: true };
 
 function fail(message: string): never {
-  throw new DisplayResultError(message);
+  throw new EvalResultError(message);
 }
 
 /**
  * Decode a completed native eval result into a GroupRunResult.
  *
- * @param details        tool_result details from the native eval call
- *                       (details.jsonOutputs = raw display() values).
- * @param spec           the validated TaskGroupSpec the group ran under.
- * @param expectedGroupId group id the payload must be addressed to.
+ * @param details         tool_result details from native eval
+ * @param spec            the validated TaskGroupSpec the group ran under
+ * @param expectedGroupId group id the payload must be addressed to
  */
-export function decodeDisplayGroupResult(
+export function decodeEvalGroupResult(
   details: unknown,
   spec: TaskGroupSpec,
   expectedGroupId: string,
 ): GroupRunResult {
   if (!isRecord(details)) {
-    fail(
-      `eval result details are not an object (got ${details === null ? "null" : typeof details}); cannot read display output`,
-    );
+    fail(`eval result details are not an object (got ${details === null ? "null" : typeof details})`);
   }
   if (details.async) {
-    fail(
-      "eval cell auto-backgrounded (details.async set); strict foreground barrier unavailable — task-group result is not final",
-    );
+    fail("eval cell auto-backgrounded (details.async set); Task Group requires a foreground result");
   }
-  const jsonOutputs = details.jsonOutputs;
-  if (!Array.isArray(jsonOutputs)) {
-    fail(`eval result details.jsonOutputs is missing or not an array (got ${typeof jsonOutputs}); expected display() values`);
+  if (!Array.isArray(details.cells)) {
+    fail(`eval result details.cells is missing or not an array (got ${typeof details.cells})`);
   }
-  const payload = selectPayload(jsonOutputs, expectedGroupId);
+  const payload = selectResultPayload(details.cells, expectedGroupId);
   return decodePayload(payload, spec, expectedGroupId);
 }
 
-/** Find the single protocol payload for this group among foreign display values. */
-function selectPayload(jsonOutputs: unknown[], expectedGroupId: string): Record<string, unknown> {
-  let protocolCount = 0;
-  let matchingCount = 0;
-  let matched: Record<string, unknown> | undefined;
+function selectResultPayload(cells: unknown[], expectedGroupId: string): Record<string, unknown> {
+  const { chunks, groupIds } = collectResultChunks(cells, expectedGroupId);
+  if (chunks.length === 0) {
+    fail(
+      `no ${EVAL_RESULT_PROTOCOL} JSON view for group ${JSON.stringify(expectedGroupId)} (group ids seen: ${groupIds.size > 0 ? [...groupIds].join(", ") : "(none)"})`,
+    );
+  }
+  return parseResultPayload(reassembleResultChunks(chunks), expectedGroupId);
+}
+
+function collectResultChunks(
+  cells: unknown[],
+  expectedGroupId: string,
+): { chunks: Record<string, unknown>[]; groupIds: Set<string> } {
+  const chunks: Record<string, unknown>[] = [];
   const groupIds = new Set<string>();
-  for (const entry of jsonOutputs) {
-    if (!isRecord(entry) || entry.protocol !== DISPLAY_PROTOCOL) continue;
-    protocolCount += 1;
-    if (typeof entry.groupId === "string") groupIds.add(entry.groupId);
-    if (entry.groupId === expectedGroupId) {
-      matchingCount += 1;
-      matched ??= entry;
+  for (const cell of cells) {
+    if (!isRecord(cell) || !Array.isArray(cell.views)) continue;
+    for (const entry of cell.views) {
+      if (!isRecord(entry) || !isRecord(entry.view) || entry.view.kind !== "json" || !isRecord(entry.view.value)) {
+        continue;
+      }
+      const value = entry.view.value;
+      if (value.protocol !== EVAL_RESULT_PROTOCOL || value.transport !== EVAL_RESULT_TRANSPORT) continue;
+      if (typeof value.groupId === "string") groupIds.add(value.groupId);
+      if (value.groupId === expectedGroupId) chunks.push(value);
     }
   }
-  if (matchingCount === 1 && matched !== undefined) return matched;
-  const foreignProtocols = [
-    ...new Set(
-      jsonOutputs.flatMap((entry) => (isRecord(entry) && typeof entry.protocol === "string" ? [entry.protocol] : [])),
-    ),
-  ];
-  if (protocolCount === 0) {
-    const seen =
-      foreignProtocols.length > 0
-        ? ` (display protocols seen: ${foreignProtocols.join(", ")})`
-        : " (no protocol-bearing display values)";
+  return { chunks, groupIds };
+}
+
+function reassembleResultChunks(chunks: Record<string, unknown>[]): string {
+  let overflow: Record<string, unknown> | undefined;
+  for (const chunk of chunks) {
+    if (chunk.overflow === true) {
+      overflow = chunk;
+      break;
+    }
+  }
+  if (overflow !== undefined) {
+    const required =
+      typeof overflow.chunkCount === "number" ? overflow.chunkCount : "more than the supported limit";
     fail(
-      `no ${DISPLAY_PROTOCOL} display payload for group ${JSON.stringify(expectedGroupId)} among ${jsonOutputs.length} eval display value(s)${seen}`,
+      `Task Group result exceeds OMP's structured-view capacity (${required} chunks required; maximum ${EVAL_RESULT_MAX_CHUNKS})`,
     );
   }
-  if (matchingCount > 1) {
-    fail(
-      `found ${matchingCount} ${DISPLAY_PROTOCOL} display payloads for group ${JSON.stringify(expectedGroupId)} (expected exactly one)`,
-    );
+
+  const chunkCount = chunks[0]?.chunkCount;
+  if (typeof chunkCount !== "number" || !Number.isInteger(chunkCount) || chunkCount < 1) {
+    fail(`eval result chunkCount must be a positive integer (got ${JSON.stringify(chunkCount)})`);
   }
-  fail(
-    `found ${protocolCount} ${DISPLAY_PROTOCOL} display payload(s) but none for group ${JSON.stringify(expectedGroupId)} (group ids seen: ${groupIds.size > 0 ? [...groupIds].join(", ") : "(none)"})`,
-  );
+  if (chunkCount > EVAL_RESULT_MAX_CHUNKS) {
+    fail(`eval result requires ${chunkCount} JSON views; OMP retains at most ${EVAL_RESULT_MAX_CHUNKS} per cell`);
+  }
+  if (chunks.length !== chunkCount) {
+    fail(`found ${chunks.length} eval result view chunk(s); expected ${chunkCount}`);
+  }
+
+  const parts: Array<string | undefined> = new Array(chunkCount);
+  for (const chunk of chunks) {
+    if (chunk.chunkCount !== chunkCount) fail("eval result view chunks disagree on chunkCount");
+    const index = chunk.chunkIndex;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= chunkCount) {
+      fail(`eval result chunkIndex is outside [0, ${chunkCount - 1}] (got ${JSON.stringify(index)})`);
+    }
+    if (typeof chunk.data !== "string") fail(`eval result chunk ${index} data must be a string`);
+    if (chunk.data.length > EVAL_RESULT_CHUNK_CHARS) {
+      fail(`eval result chunk ${index} exceeds ${EVAL_RESULT_CHUNK_CHARS} characters`);
+    }
+    if (parts[index] !== undefined) fail(`duplicate eval result view chunk at index ${index}`);
+    parts[index] = chunk.data;
+  }
+  for (const part of parts) {
+    if (part === undefined) fail("eval result view chunks are incomplete");
+  }
+  return parts.join("");
+}
+
+function parseResultPayload(serialized: string, expectedGroupId: string): Record<string, unknown> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(serialized);
+  } catch {
+    fail("eval result view chunks do not contain valid JSON");
+  }
+  if (!isRecord(payload)) fail("eval result payload must be an object");
+  if (payload.protocol !== EVAL_RESULT_PROTOCOL) {
+    fail(`eval result payload protocol must be ${JSON.stringify(EVAL_RESULT_PROTOCOL)}`);
+  }
+  if (payload.groupId !== expectedGroupId) {
+    fail(`eval result payload groupId must equal ${JSON.stringify(expectedGroupId)}`);
+  }
+  return payload;
 }
 
 function decodePayload(
@@ -125,31 +162,31 @@ function decodePayload(
 ): GroupRunResult {
   const strategy = payload.strategy;
   if (strategy !== "fanout" && strategy !== "pool") {
-    fail(`display payload strategy must be "fanout" | "pool" (got ${JSON.stringify(strategy)})`);
+    fail(`eval result payload strategy must be "fanout" | "pool" (got ${JSON.stringify(strategy)})`);
   }
   const groupState = payload.groupState;
   if (typeof groupState !== "string" || GROUP_STATES[groupState] !== true) {
-    fail(`display payload groupState must be "completed" | "failed" | "cancelled" (got ${JSON.stringify(groupState)})`);
+    fail(`eval result payload groupState must be "completed" | "failed" | "cancelled" (got ${JSON.stringify(groupState)})`);
   }
   const rawChildChars = payload.rawChildChars;
   if (typeof rawChildChars !== "number" || !Number.isInteger(rawChildChars) || rawChildChars < 0) {
-    fail(`display payload rawChildChars must be a non-negative integer (got ${JSON.stringify(rawChildChars)})`);
+    fail(`eval result payload rawChildChars must be a non-negative integer (got ${JSON.stringify(rawChildChars)})`);
   }
   const outcomes = decodeOutcomes(payload.outcomes, spec);
 
   let groupError: string | undefined;
   if (payload.groupError !== undefined) {
-    if (typeof payload.groupError !== "string") fail("display payload groupError must be a string");
+    if (typeof payload.groupError !== "string") fail("eval result payload groupError must be a string");
     groupError = payload.groupError;
   }
   let summary: string | undefined;
   if (payload.summary !== undefined) {
-    if (typeof payload.summary !== "string") fail("display payload summary must be a string");
+    if (typeof payload.summary !== "string") fail("eval result payload summary must be a string");
     summary = payload.summary;
   }
   const summaryError = payload.summaryError;
   if (summaryError !== undefined && typeof summaryError !== "string") {
-    fail("display payload summaryError must be a string");
+    fail("eval result payload summaryError must be a string");
   }
 
   // Wire groupState is authoritative: a "failed" group with no explicit
@@ -177,7 +214,7 @@ function decodePayload(
 
 function decodeOutcomes(rawOutcomes: unknown, spec: TaskGroupSpec): TaskOutcome[] {
   if (!Array.isArray(rawOutcomes) || rawOutcomes.length === 0) {
-    fail("display payload outcomes must be a non-empty array");
+    fail("eval result payload outcomes must be a non-empty array");
   }
   const expectedNames = spec.tasks.map((task) => task.name);
   const expectedAgents = new Map(spec.tasks.map((task) => [task.name, task.agent]));
@@ -185,7 +222,7 @@ function decodeOutcomes(rawOutcomes: unknown, spec: TaskGroupSpec): TaskOutcome[
   const counts = new Map<string, number>();
   const outcomes: TaskOutcome[] = [];
   rawOutcomes.forEach((raw, i) => {
-    const ctx = `display payload outcomes[${i}]`;
+    const ctx = `eval result payload outcomes[${i}]`;
     if (!isRecord(raw)) fail(`${ctx} must be an object`);
     const name = raw.name;
     if (typeof name !== "string" || name.length === 0) {
@@ -242,10 +279,10 @@ function decodeOutcomes(rawOutcomes: unknown, spec: TaskGroupSpec): TaskOutcome[
   for (const name of expectedNames) {
     const count = counts.get(name);
     if (count === undefined) {
-      fail(`display payload is missing an outcome for task ${JSON.stringify(name)} (refusing partial success)`);
+      fail(`eval result payload is missing an outcome for task ${JSON.stringify(name)} (refusing partial success)`);
     }
     if (count > 1) {
-      fail(`display payload has ${count} outcomes for task ${JSON.stringify(name)} (expected exactly one)`);
+      fail(`eval result payload has ${count} outcomes for task ${JSON.stringify(name)} (expected exactly one)`);
     }
   }
   return outcomes;

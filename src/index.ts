@@ -3,8 +3,8 @@
  *
  * Task Group deliberately does not register `eval`. A standard JavaScript eval
  * cell containing the strict `ompTaskGroup(<JSON>)` envelope is rewritten at
- * `tool_call`, then its native `display()` payload is finalized at
- * `tool_result`. Ordinary eval calls never enter this path.
+ * `tool_call`; the compiled program returns its result through OMP eval JSON
+ * views, which the `tool_result` hook decodes. Ordinary eval calls are untouched.
  *
  * Public API only: docs/extensions.md and docs/tools/eval.md. No OMP private
  * imports, no global mutable state, and protocol failures are fail-closed.
@@ -23,7 +23,7 @@ import { loadConfig, ConfigLoadError } from "./config-load";
 import { defaultConfig, type TaskGroupConfig } from "./config";
 import { scanAutoBackgroundConfig } from "./barriers";
 import type { BackendCapabilities, TaskGroupBackend } from "./backend/interface";
-import { decodeDisplayGroupResult } from "./backend/display-result";
+import { decodeEvalGroupResult } from "./backend/eval-result";
 import { compileFanoutProgram, compilePoolProgram } from "./compiler/program";
 import { parseTaskGroupEnvelope } from "./envelope";
 import { newGroupId, runTaskGroup } from "./engine/runner";
@@ -58,7 +58,7 @@ function nativeEvalCapabilities(config: TaskGroupConfig): BackendCapabilities {
     rpcUi: false,
     notes: [
       "compiled through the standard native eval tool",
-      "final result is decoded from native details.jsonOutputs",
+      "final result is decoded from native details.cells[].views[].view.value",
       "no Task Group live marker stream",
     ],
   };
@@ -257,7 +257,7 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
     if (event.isError) return undefined;
 
     try {
-      const result = decodeDisplayGroupResult(event.details, pending.spec, pending.groupId);
+      const result = decodeEvalGroupResult(event.details, pending.spec, pending.groupId);
       const backend: TaskGroupBackend = {
         capabilities: () => pending.capabilities,
         runGroup: async () => result,
@@ -280,7 +280,7 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
       };
     } catch (error) {
       return resultError(
-        `native eval completed without a valid Task Group display result: ${error instanceof Error ? error.message : String(error)}`,
+        `native eval completed without a valid Task Group eval result: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   });

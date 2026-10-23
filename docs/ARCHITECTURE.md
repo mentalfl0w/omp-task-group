@@ -6,7 +6,7 @@
 ┌────────────────────────────────────────────────────────────┐
 │ src/index.ts            extension wiring (public API only) │
 │   ├─ tool_call hook: envelope detect → input rewrite/block │
-│   ├─ tool_result hook: finalize via details.jsonOutputs    │
+│   ├─ tool_result hook: finalize from OMP JSON views          │
 │   ├─ hooks: before_agent_start (policy) / missed-group     │
 │   ├─ /task-group command                                   │
 │   └─ telemetry rehydrate + capability probe                │
@@ -18,15 +18,15 @@
 ├────────────────────────────────────────────────────────────┤
 │ COMPILER (src/compiler)                                    │
 │   envelope → self-contained JS program (public prelude)    │
-│   DISPLAY_PROTOCOL "omp-task-group/eval-result-v1"         │
+│   EVAL_RESULT_PROTOCOL "omp-task-group/eval-result-v1"      │
 ├────────────────────────────────────────────────────────────┤
-│ FINALIZER (src/backend/display-result.ts)                  │
-│   decodeDisplayGroupResult: native details.jsonOutputs     │
+│ FINALIZER (src/backend/eval-result.ts)                      │
+│   decodeEvalGroupResult: details.cells[].views              │
 │   → stable snapshot details (omp-task-group/v1)            │
 ├────────────────────────────────────────────────────────────┤
 │ KERNEL (inside the native eval cell, compiled program)     │
 │   ONLY public prelude: agent / wait / workpool /           │
-│   completion / display / print / tool.hub                  │
+│   completion / console.log / phase / tool.hub              │
 └────────────────────────────────────────────────────────────┘
 │ RESULT GATE (src/result)   bound the delivered bytes       │
 │ PRESENTATION (src/presentation)  digest text from snapshot │
@@ -51,19 +51,24 @@ exactly the envelope). Two hooks turn that call into a group:
    - recognized but malformed envelope → `{ block: true, reason }` with a precise
      reason (a recognized malformed envelope is never executed as ordinary JS);
    - anything else → untouched ordinary eval (never claimed as plugin-owned).
-2. **`tool_result` (finalization).** The compiled program calls `display()` exactly
-   once with the wire payload (`protocol: "omp-task-group/eval-result-v1"`, group
-   id, strategy, group state, clipped per-task outcomes, optional group/summary
-   error). OMP stores the full display value in native `details.jsonOutputs`;
-   `decodeDisplayGroupResult(details, spec, expectedGroupId)` selects the exact
-   protocol + group id, validates result shape / task names / statuses, and folds
-   the outcome set back into the **stable snapshot details** —
-   `{ protocol: "omp-task-group/v1", snapshot, gate, ... }`. The tool result is
-   finalized with the bounded digest text as content and that snapshot as details.
+2. **`tool_result` (finalization).** The compiled program serializes the wire
+   payload (`protocol: "omp-task-group/eval-result-v1"`, group id, strategy,
+   state, clipped outcomes, and optional summary/error) and sends it through
+   `console.log()` as OMP JSON-view chunks. The eval result exposes those values
+   at `details.cells[].views[].view.value`. `decodeEvalGroupResult` selects the
+   exact protocol, transport, and group id, verifies every chunk, parses the
+   payload, validates task names/statuses, and folds outcomes into the stable
+   snapshot details — `{ protocol: "omp-task-group/v1", snapshot, gate, ... }`.
+   The hook then replaces the native result with the bounded digest and snapshot.
 
-There is no custom live-update transport: no `@@TG_*` stdout markers, no streamed
-RPC snapshot channel, no widget updates. Output lines the native eval cell happens
-to show while a group runs are ordinary cell output, not Task Group transport.
+OMP v18.12 retains at most 16 JSON views per cell and drops a view over 32 KiB.
+The compiler emits 14,000-character chunks; results requiring more than 16
+chunks produce a fail-closed size error instead of a partial result.
+
+There is no custom live-update stream, RPC snapshot channel, or widget. The
+`console.log()` JSON views are ordinary cell output used only for final result
+transport; they do not carry live per-task progress.
+
 
 ## Why the parent sees exactly one delivery
 
@@ -73,8 +78,8 @@ to show while a group runs are ordinary cell output, not Task Group transport.
    deliveries are consumed in-cell and never re-deliver to the parent.
 2. Early-exit joins (`any`, `quorum`, `fail_fast`) cancel pending children and
    reap their waits (3s gate), so cancelled children never re-deliver either.
-3. The single `display()` call is the only thing the parent sees: one native eval
-   tool result, finalized by the `tool_result` hook.
+3. One native eval result, finalized by the `tool_result` hook, is the only
+   continuation the parent receives.
 
 ## Envelope grammar
 
@@ -87,14 +92,11 @@ to show while a group runs are ordinary cell output, not Task Group transport.
 ## Compiler invariants
 
 - Spec embeds as JSON inside the rewritten cell — no escaping holes.
-- The compiled program uses only the public eval prelude and calls `display()`
-  exactly once with the `omp-task-group/eval-result-v1` payload
-  (`{ protocol, groupId, strategy, groupState, rawChildChars, outcomes,
-  groupError?, summary?, summaryError? }`).
-- Outcomes carry `name`, `agent`, settled `status`, and optionally `handle`,
-  `durationMs`, `resolvedModel`, clipped `result`, `structured`, `error`.
-- Per-task output is clipped before display; the payload is bounded by
-  construction. No `import` / `require` / `process` anywhere in the program.
+- The compiled program uses only OMP's public eval prelude and sends the
+  `omp-task-group/eval-result-v1` payload through JSON-view chunks.
+- Each chunk is 14,000 characters or less; at most 16 chunks fit one eval cell.
+- Per-task output is clipped before transport. No `import` / `require` /
+  `process` appears in the generated program.
 - Join semantics:
   - `all + collect` → race until every child settles, no early exit
   - `all + fail_fast` → first failure cancels the rest
@@ -102,16 +104,15 @@ to show while a group runs are ordinary cell output, not Task Group transport.
 - Pool only for `all + collect` homogeneous batches.
 - `Promise.withResolvers()` for the reap gate (3s), `setTimeout` contained.
 
-## Finalizer invariants (display-result)
+## Finalizer invariants (eval-result)
 
-- `decodeDisplayGroupResult(details, spec, expectedGroupId)` reads native
-  `details.jsonOutputs`; anything missing / foreign / wrong-group-id throws a
-  descriptive error rather than guessing.
-- Validates result shape, task names against the spec, and statuses; a
-  `details.async` native result (steering-triggered auto-background) is decoded
-  as a barrier violation — detected and fail-closed, never hidden.
-- The finalized details are always the stable snapshot shape
-  (`omp-task-group/v1`); raw `jsonOutputs` never leaks to the caller.
+- `decodeEvalGroupResult(details, spec, expectedGroupId)` reads native
+  `details.cells[].views[].view.value`; missing, foreign, duplicate, incomplete,
+  malformed, or oversized chunks fail closed.
+- The decoder validates the inner protocol/group id, result shape, task names,
+  and statuses. A `details.async` result remains a foreground-barrier violation.
+- Final details always use the stable snapshot shape
+  (`omp-task-group/v1`); raw eval views never leak to the caller.
 
 ## Barrier discipline
 

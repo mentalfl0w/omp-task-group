@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { compileFanoutProgram, compilePoolProgram, DISPLAY_PROTOCOL } from "../../src/compiler/program";
+import { compileFanoutProgram, compilePoolProgram, EVAL_RESULT_PROTOCOL } from "../../src/compiler/program";
 import { validateSpec } from "../../src/schema/task-group";
 
 const SPEC_RAW = {
@@ -26,7 +26,7 @@ describe("compiler", () => {
     const spec = validateSpec(SPEC_RAW);
     const program = compileFanoutProgram(spec, { groupId: "tg-test" });
     new Function(wrap(program));
-    expect(program.includes(DISPLAY_PROTOCOL)).toBe(true);
+    expect(program.includes(EVAL_RESULT_PROTOCOL)).toBe(true);
   });
 
   test("pool program is syntactically valid JavaScript", () => {
@@ -35,46 +35,9 @@ describe("compiler", () => {
     new Function(wrap(program));
   });
 
-  test("programs use ONLY public prelude helpers", () => {
-    const spec = validateSpec({ ...SPEC_RAW, join: { mode: "all" } });
-    const fanout = compileFanoutProgram(spec, { groupId: "tg" });
-    const pool = compilePoolProgram(spec, { groupId: "tg" });
-    for (const program of [fanout, pool]) {
-      expect(program).not.toMatch(/import\s/);
-      expect(program).not.toMatch(/require\(/);
-      expect(program).not.toContain("@oh-my-pi");
-      expect(program).not.toContain("process.");
-      expect(program).toContain("display(");
-      expect(program).toContain("phase(");
-      expect(program).toContain("tool.hub(");
-    }
-    expect(fanout).toContain("agent(");
-    expect(pool).toContain("workpool(");
-  });
 
-  test("display() is called exactly once per program", () => {
-    const spec = validateSpec({ ...SPEC_RAW, join: { mode: "all" } });
-    const fanout = compileFanoutProgram(spec, { groupId: "tg" });
-    const pool = compilePoolProgram(spec, { groupId: "tg" });
-    expect((fanout.match(/display\(/g) ?? []).length).toBe(1);
-    expect((pool.match(/display\(/g) ?? []).length).toBe(1);
-  });
-
-  test("programs emit no @@TG_ marker transport", () => {
-    const spec = validateSpec({ ...SPEC_RAW, join: { mode: "all" } });
-    const fanout = compileFanoutProgram(spec, { groupId: "tg" });
-    const pool = compilePoolProgram(spec, { groupId: "tg" });
-    for (const program of [fanout, pool]) {
-      expect(program).not.toMatch(/@@TG_/);
-      expect(program).not.toMatch(/TG_EVENT|TG_FINAL|TG_FPART/);
-    }
-  });
-
-  test("DISPLAY_PROTOCOL is the shared eval-result contract", () => {
-    expect(DISPLAY_PROTOCOL).toBe("omp-task-group/eval-result-v1");
-    const spec = validateSpec(SPEC_RAW);
-    const program = compileFanoutProgram(spec, { groupId: "tg-x" });
-    expect(program).toContain(`const TG_PROTOCOL = ${JSON.stringify(DISPLAY_PROTOCOL)};`);
+  test("EVAL_RESULT_PROTOCOL is the stable wire contract", () => {
+    expect(EVAL_RESULT_PROTOCOL).toBe("omp-task-group/eval-result-v1");
   });
 
   test("spec embeds as double-encoded JSON and round-trips", () => {

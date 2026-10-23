@@ -3,7 +3,7 @@
  *
  * The engine (planner/join/result-gate/telemetry) depends only on this
  * interface. The standard-eval envelope hook compiles and runs the group,
- * then supplies its validated display result through this seam. If OMP later
+ * then supplies its validated eval result through this seam. If OMP later
  * ships a public ctx.agents spawn/join surface, a live backend can be added
  * without changing engine/result-gate behavior.
  */
