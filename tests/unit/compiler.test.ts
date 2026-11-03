@@ -34,6 +34,11 @@ describe("compiler", () => {
     const program = compilePoolProgram(spec, { groupId: "tg-test" });
     new Function(wrap(program));
   });
+  test("generated eval programs do not call the removed hub tool", () => {
+    const spec = validateSpec(SPEC_RAW);
+    expect(compileFanoutProgram(spec, { groupId: "tg-no-hub" })).not.toContain("tool.hub(");
+    expect(compilePoolProgram(spec, { groupId: "tg-no-hub" })).not.toContain("tool.hub(");
+  });
 
 
   test("EVAL_RESULT_PROTOCOL is the stable wire contract", () => {

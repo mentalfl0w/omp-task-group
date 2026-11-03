@@ -1,13 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { compileFanoutProgram, compilePoolProgram, EVAL_RESULT_PROTOCOL, EVAL_RESULT_TRANSPORT } from "../../src/compiler/program";
 import { validateSpec } from "../../src/schema/task-group";
 import type { TaskGroupSpec } from "../../src/schema/task-group";
 
 /**
  * Executable transport test: run the compiled program inside a mocked OMP eval
- * kernel (agent / wait / completion / workpool / console.log / phase /
- * tool.hub) and verify the JSON-view result end-to-end: protocol, inline
- * outcomes, clipping, join/cancel semantics, and pool recovery.
+ * kernel (agent / wait / completion / workpool / console.log / phase / tool)
+ * and verify JSON-view results, clipping, join/cancel semantics, and Pool recovery.
  */
 
 interface Outcome {
@@ -30,6 +29,7 @@ interface TaskGroupResultPayload {
   rawChildChars: number;
   outcomes: Outcome[];
   groupError?: string;
+  fallbackReason?: string;
   summary?: string;
   summaryError?: string;
 }
@@ -91,7 +91,7 @@ function makeKernel(results: Array<unknown>): MockKernel {
   fns.workpool = () => {
     throw new Error("workpool must not be used in fanout programs");
   };
-  fns.tool = { hub: async () => ({ text: "", details: { jobs: [] } }) };
+  fns.tool = {};
   installRunner(kernel, fns);
   return kernel;
 }
@@ -203,6 +203,108 @@ describe("compiled program execution (mocked kernel)", () => {
     expect(kernel.phases.filter((p) => p.endsWith("succeeded"))).toHaveLength(3);
   });
 
+  test("Fanout treats rejected strings and undefined rejections as failures", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      failure: { mode: "collect" },
+      tasks: [
+        { name: "spawn-rejected", agent: "sonic", task: "Spawn reject" },
+        { name: "wait-rejected", agent: "sonic", task: "Wait reject" },
+        { name: "undefined-result", agent: "sonic", task: "Resolve undefined" },
+      ],
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let calls = 0;
+    installRunner(kernel, {
+      agent: async (_prompt: string, opts: { label: string }) => {
+        const index = calls++;
+        if (index === 0) throw undefined;
+        return {
+          handle: `agent://${opts.label}`,
+          wait: async () => {
+            if (index === 1) throw "string rejection";
+            return undefined;
+          },
+          status: async () => "failed",
+          cancel: async () => {},
+        };
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => {
+        throw new Error("not a pool test");
+      },
+      tool: {},
+    });
+    await kernel.run(compileFanoutProgram(spec, { groupId: "tg-rejected-values" }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.groupState).toBe("completed");
+    expect(payload.outcomes).toHaveLength(3);
+    expect(byName(payload, "spawn-rejected")).toMatchObject({
+      status: "failed",
+      error: "agent promise rejected without an error value",
+    });
+    expect(byName(payload, "wait-rejected").status).toBe("failed");
+    expect(byName(payload, "wait-rejected").error).toContain("string rejection");
+    expect(byName(payload, "undefined-result")).toMatchObject({ status: "succeeded" });
+    expect(byName(payload, "undefined-result").result).toBeUndefined();
+    expect(byName(payload, "undefined-result").structured).toBeUndefined();
+  });
+
+  test("Fanout cancels and reaps a handle when its first wait fails while running", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      failure: { mode: "collect" },
+      tasks: [
+        { name: "transient", agent: "sonic", task: "Transient wait failure" },
+        { name: "normal", agent: "sonic", task: "Normal result" },
+      ],
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let calls = 0;
+    let waitCalls = 0;
+    let statusCalls = 0;
+    let cancelCalls = 0;
+    installRunner(kernel, {
+      agent: async (_prompt: string, opts: { label: string }) => {
+        const index = calls++;
+        return {
+          handle: `agent://${opts.label}`,
+          wait: async () => {
+            waitCalls++;
+            if (index === 0 && waitCalls === 1) throw new Error("temporary wait failure");
+            return index === 0 ? new Error("cancelled by Task Group") : "normal result";
+          },
+          status: async () => (statusCalls++ === 0 ? "running" : "cancelled"),
+          cancel: async () => {
+            cancelCalls++;
+            return true;
+          },
+        };
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => {
+        throw new Error("not a pool test");
+      },
+      tool: {},
+    });
+    await kernel.run(compileFanoutProgram(spec, { groupId: "tg-wait-reap" }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.groupState).toBe("completed");
+    expect(payload.outcomes).toHaveLength(2);
+    expect(byName(payload, "transient")).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by Task Group",
+    });
+    expect(byName(payload, "normal")).toMatchObject({ status: "succeeded", result: "normal result" });
+    expect(waitCalls).toBe(3);
+    expect(statusCalls).toBe(1);
+    expect(cancelCalls).toBe(1);
+  });
+
   test("structured child values ride inline in outcomes", async () => {
     const obj = { verdict: "ok", scores: [1, 2, 3] };
     const { kernel } = await runFanout(SPEC3, "tg-str", [obj, "text-1", "text-2"]);
@@ -276,7 +378,7 @@ describe("compiled program execution (mocked kernel)", () => {
       workpool: () => {
         throw new Error("no pool in fanout");
       },
-      tool: { hub: async () => ({ text: "", details: { jobs: [] } }) },
+      tool: {},
     };
     installRunner(kernel, fns);
     await kernel.run(program);
@@ -290,6 +392,315 @@ describe("compiled program execution (mocked kernel)", () => {
     expect(slow.status).toBe("cancelled");
     expect(slow.error).toBe("cancelled: aborted by group exit");
     expect(cancelled.some((l) => l.endsWith("slow"))).toBe(true);
+  });
+  test("fail_fast records pending and never-started tasks exactly once", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      join: { mode: "all" },
+      failure: { mode: "fail_fast" },
+      execution: { strategy: "fanout", concurrency: 2 },
+      tasks: [
+        { name: "ff0", agent: "sonic", task: "T0" },
+        { name: "ff1", agent: "sonic", task: "T1" },
+        { name: "ff2", agent: "sonic", task: "T2" },
+        { name: "ff3", agent: "sonic", task: "T3" },
+      ],
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let spawned = 0;
+    let cancelPending: (() => void) | undefined;
+    const cancelled: string[] = [];
+    const agent = async (_prompt: string, opts: { label: string }) => {
+      spawned++;
+      return {
+        handle: `agent://${opts.label}`,
+        wait: () =>
+          opts.label.endsWith("-ff0")
+            ? Promise.reject(new Error("fatal child failure"))
+            : new Promise((resolve) => {
+                cancelPending = () => resolve(new Error("cancelled by group"));
+              }),
+        status: async () => (opts.label.endsWith("-ff0") ? "failed" : "cancelled"),
+        cancel: async () => {
+          cancelled.push(opts.label);
+          cancelPending?.();
+          return true;
+        },
+      };
+    };
+    const fns: FnMap = { agent, wait: async () => [], completion: async () => ({ wait: async () => "d" }) };
+    installRunner(kernel, fns);
+    await kernel.run(compileFanoutProgram(spec, { groupId: "tg-ff" }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.groupState).toBe("failed");
+    expect(spawned).toBe(2);
+    expect(payload.outcomes).toHaveLength(4);
+    expect(new Set(payload.outcomes.map((outcome) => outcome.name)).size).toBe(4);
+    expect(byName(payload, "ff0").status).toBe("failed");
+    expect(byName(payload, "ff1").status).toBe("cancelled");
+    expect(byName(payload, "ff2")).toMatchObject({ status: "cancelled", error: expect.any(String) });
+    expect(byName(payload, "ff3")).toMatchObject({ status: "cancelled", error: expect.any(String) });
+    expect(cancelled).toEqual(["tg-ff-ff1"]);
+  });
+
+  test("synchronous handle.wait errors become task outcomes", async () => {
+    const fns: FnMap = {
+      agent: async (_prompt: string, opts: { label: string }) => ({
+        handle: `agent://${opts.label}`,
+        wait: () => {
+          throw new Error("synchronous wait failure");
+        },
+        status: async () => "failed",
+        cancel: async () => false,
+      }),
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "d" }),
+    };
+    const kernel = makeKernel([]);
+    Object.assign(fns, { console: undefined, phase: undefined });
+    installRunner(kernel, fns);
+
+    let thrown: unknown;
+    try {
+      await kernel.run(compileFanoutProgram(SPEC3, { groupId: "tg-sync-wait" }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeUndefined();
+    const payload = lastEvalPayload(kernel);
+    expect(payload.groupState).toBe("failed");
+    expect(payload.outcomes).toHaveLength(3);
+    for (const outcome of payload.outcomes) {
+      expect(outcome.status).toBe("failed");
+      expect(outcome.error).toContain("synchronous wait failure");
+    }
+  });
+
+  test("maxGroupMs cancels and reaps every pending fanout handle", async () => {
+    vi.useFakeTimers();
+    try {
+      const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+      const cancelled: string[] = [];
+      let started = 0;
+      const fns: FnMap = {
+        agent: async (_prompt: string, opts: { label: string }) => {
+          const gate = Promise.withResolvers<unknown>();
+          return {
+            handle: `agent://${opts.label}`,
+            wait: () => {
+              started++;
+              return gate.promise;
+            },
+            status: async () => (cancelled.includes(opts.label) ? "cancelled" : "running"),
+            cancel: async () => {
+              cancelled.push(opts.label);
+              gate.resolve(new Error("cancelled by timeout"));
+              return true;
+            },
+          };
+        },
+        wait: async () => [],
+        completion: async () => ({ wait: async () => "d" }),
+      };
+      installRunner(kernel, fns);
+      const run = kernel.run(compileFanoutProgram(SPEC3, { groupId: "tg-timeout", maxGroupMs: 10 }));
+      for (let index = 0; index < 20 && started < 3; index++) await Promise.resolve();
+      expect(started).toBe(3);
+      vi.advanceTimersByTime(10);
+      await run;
+      const payload = lastEvalPayload(kernel);
+      expect(payload.groupState).toBe("failed");
+      expect(payload.groupError).toContain("maxGroupMs");
+      expect(payload.outcomes).toHaveLength(3);
+      expect(payload.outcomes.every((outcome) => outcome.status === "cancelled")).toBe(true);
+      expect(cancelled).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("Fanout does not spawn queued tasks after the group deadline", async () => {
+    const realNow = Date.now;
+    let clock = realNow();
+    Date.now = () => clock;
+    try {
+      const spec = validateSpec({
+        context: "Ctx",
+        execution: { strategy: "fanout", concurrency: 1 },
+        tasks: [
+          { name: "deadline-first", agent: "sonic", task: "First" },
+          { name: "deadline-queued-1", agent: "sonic", task: "Queued 1" },
+          { name: "deadline-queued-2", agent: "sonic", task: "Queued 2" },
+        ],
+      });
+      const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+      let agentCalls = 0;
+      installRunner(kernel, {
+        agent: async (_prompt: string, opts: { label: string }) => {
+          agentCalls++;
+          return {
+            handle: `agent://${opts.label}`,
+            wait: async () => {
+              clock += 20;
+              return "first task";
+            },
+            cancel: async () => true,
+          };
+        },
+        wait: async () => [],
+        completion: async () => ({ wait: async () => "digest" }),
+        workpool: async () => {
+          throw new Error("not a Pool test");
+        },
+        tool: {},
+      });
+      await kernel.run(compileFanoutProgram(spec, { groupId: "tg-deadline-spawn", maxGroupMs: 10 }));
+      const payload = lastEvalPayload(kernel);
+
+      expect(agentCalls).toBe(1);
+      expect(payload.groupState).toBe("failed");
+      expect(payload.groupError).toContain("maxGroupMs");
+      expect(payload.outcomes).toHaveLength(3);
+      expect(byName(payload, "deadline-first").status).toBe("succeeded");
+      expect(byName(payload, "deadline-queued-1").status).toBe("cancelled");
+      expect(byName(payload, "deadline-queued-2").status).toBe("cancelled");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+
+  test("Fanout AgentHandle timeouts use OMP seconds while respecting the millisecond group deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const spec = validateSpec({
+        context: "Ctx",
+        failure: { mode: "collect" },
+        tasks: [
+          { name: "timeout-unit-a", agent: "sonic", task: "A" },
+          { name: "timeout-unit-b", agent: "sonic", task: "B" },
+        ],
+      });
+      const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+      const waitTimeouts: number[] = [];
+      const pending = new Map<string, { resolve: (value: unknown) => void; cancelTimer: () => void }>();
+      const cancelled = new Set<string>();
+      installRunner(kernel, {
+        agent: async (_prompt: string, opts: { label: string }) => ({
+          handle: `agent://${opts.label}`,
+          wait: ({ timeout }: { timeout: number }) => {
+            waitTimeouts.push(timeout);
+            if (cancelled.has(opts.label)) return Promise.resolve(new Error("cancelled"));
+            return new Promise((resolve) => {
+              const timer = setTimeout(() => resolve("done"), Math.max(1, timeout * 1000 - 1));
+              pending.set(opts.label, { resolve, cancelTimer: () => clearTimeout(timer) });
+            });
+          },
+          status: async () => (cancelled.has(opts.label) ? "cancelled" : "running"),
+          cancel: async () => {
+            cancelled.add(opts.label);
+            const entry = pending.get(opts.label);
+            if (entry) {
+              entry.cancelTimer();
+              entry.resolve(new Error("cancelled"));
+            }
+            return true;
+          },
+        }),
+        wait: async () => [],
+        completion: async () => ({ wait: async () => "digest" }),
+        workpool: async () => {
+          throw new Error("not a Pool test");
+        },
+        tool: {},
+      });
+      const run = kernel.run(compileFanoutProgram(spec, { groupId: "tg-wait-timeout-unit", maxGroupMs: 1000 }));
+      for (let i = 0; i < 30 && waitTimeouts.length < 2; i++) await Promise.resolve();
+      expect(waitTimeouts).toHaveLength(2);
+      vi.advanceTimersByTime(999);
+      await run;
+      const payload = lastEvalPayload(kernel);
+
+      expect(payload.groupState).toBe("completed");
+      expect(payload.outcomes.every((outcome) => outcome.status === "succeeded")).toBe(true);
+      expect(waitTimeouts.every((timeout) => timeout > 0 && timeout <= 1)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("Fanout cancellation reaper honors bounded OMP-second waits", async () => {
+    vi.useFakeTimers();
+    try {
+      const spec = validateSpec({
+        context: "Ctx",
+        execution: { strategy: "fanout", concurrency: 1 },
+        failure: { mode: "collect" },
+        tasks: [
+          { name: "reap-first", agent: "sonic", task: "First" },
+          { name: "reap-second", agent: "sonic", task: "Second" },
+        ],
+      });
+      const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+      let firstWaitCalls = 0;
+      let reapWaitCalls = 0;
+      let cancelCalls = 0;
+      let cancelled = false;
+      installRunner(kernel, {
+        agent: async (_prompt: string, opts: { label: string }) => {
+          if (opts.label.endsWith("-reap-second")) {
+            return {
+              handle: `agent://${opts.label}`,
+              wait: async () => "second result",
+              cancel: async () => false,
+            };
+          }
+          return {
+            handle: `agent://${opts.label}`,
+            wait: ({ timeout }: { timeout: number }) => {
+              firstWaitCalls++;
+              if (firstWaitCalls === 1) throw new Error("transient wait failure");
+              reapWaitCalls++;
+              return new Promise((_resolve, reject) => {
+                setTimeout(() => reject(new Error("reaper wait timed out")), timeout * 1000);
+              });
+            },
+            status: async () => (cancelled ? "cancelled" : "running"),
+            cancel: async () => {
+              cancelCalls++;
+              cancelled = true;
+              return true;
+            },
+          };
+        },
+        wait: async () => [],
+        completion: async () => ({ wait: async () => "digest" }),
+        workpool: async () => {
+          throw new Error("not a Pool test");
+        },
+        tool: {},
+      });
+      const run = kernel.run(compileFanoutProgram(spec, { groupId: "tg-reaper-units", maxGroupMs: 60_000 }));
+      for (let spin = 0; spin < 100 && reapWaitCalls < 1; spin++) await Promise.resolve();
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        for (let spin = 0; spin < 100 && reapWaitCalls < attempt; spin++) await Promise.resolve();
+        expect(reapWaitCalls).toBe(attempt);
+        vi.advanceTimersByTime(10_000);
+        for (let spin = 0; spin < 100; spin++) await Promise.resolve();
+      }
+      await run;
+      const payload = lastEvalPayload(kernel);
+
+      expect(firstWaitCalls).toBe(4);
+      expect(cancelCalls).toBe(1);
+      expect(payload.groupState).toBe("completed");
+      expect(byName(payload, "reap-first").status).toBe("cancelled");
+      expect(byName(payload, "reap-first").error).toContain("could not be reaped");
+      expect(byName(payload, "reap-second")).toMatchObject({ status: "succeeded", result: "second result" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("failures classify as failed/cancelled with errors, group completes (collect)", async () => {
@@ -305,6 +716,97 @@ describe("compiled program execution (mocked kernel)", () => {
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.error).toContain("cancel: interrupted");
     expect(payload.rawChildChars).toBe(4); // only "fine" succeeded
+  });
+  test("all+collect reports a failed group when every child fails", async () => {
+    const { kernel } = await runFanout(SPEC3, "tg-all-failed", [
+      new Error("failure-0"),
+      new Error("failure-1"),
+      new Error("failure-2"),
+    ]);
+    const payload = lastEvalPayload(kernel);
+    expect(payload.groupState).toBe("failed");
+    expect(payload.outcomes).toHaveLength(3);
+    expect(new Set(payload.outcomes.map((outcome) => outcome.name)).size).toBe(3);
+    expect(payload.outcomes.every((outcome) => outcome.status === "failed")).toBe(true);
+  });
+
+  test("quorum stops after the threshold and records cancelled losers", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      join: { mode: "quorum", quorum: 2 },
+      tasks: [
+        { name: "q0", agent: "sonic", task: "Q0" },
+        { name: "q1", agent: "sonic", task: "Q1" },
+        { name: "q2", agent: "sonic", task: "Q2" },
+      ],
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    const slow = Promise.withResolvers<unknown>();
+    const cancelled: string[] = [];
+    const agent = async (_prompt: string, opts: { label: string }) => ({
+      handle: `agent://${opts.label}`,
+      wait: () => opts.label.endsWith("-q2") ? slow.promise : Promise.resolve("success:" + opts.label),
+      status: async () => (cancelled.includes(opts.label) ? "cancelled" : "running"),
+      cancel: async () => {
+        cancelled.push(opts.label);
+        slow.resolve(new Error("cancelled after quorum"));
+        return true;
+      },
+    });
+    installRunner(kernel, { agent, wait: async () => [], completion: async () => ({ wait: async () => "d" }) });
+    await kernel.run(compileFanoutProgram(spec, { groupId: "tg-quorum" }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.groupState).toBe("completed");
+    expect(payload.outcomes).toHaveLength(3);
+    expect(payload.outcomes.filter((outcome) => outcome.status === "succeeded")).toHaveLength(2);
+    expect(byName(payload, "q2").status).toBe("cancelled");
+    expect(cancelled).toEqual(["tg-quorum-q2"]);
+  });
+
+  test("fanout never exceeds the requested concurrency and refills slots", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      execution: { strategy: "fanout", concurrency: 2 },
+      tasks: Array.from({ length: 5 }, (_, i) => ({ name: `c${i}`, agent: "sonic", task: `C${i}` })),
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let active = 0;
+    let maximumActive = 0;
+    let spawned = 0;
+    const pending: Array<{ label: string; resolve(value: unknown): void }> = [];
+    const agent = async (_prompt: string, opts: { label: string }) => {
+      spawned++;
+      return {
+        handle: `agent://${opts.label}`,
+        wait: () => {
+          active++;
+          maximumActive = Math.max(maximumActive, active);
+          const gate = Promise.withResolvers<unknown>();
+          pending.push({ label: opts.label, resolve: gate.resolve });
+          return gate.promise.finally(() => {
+            active--;
+          });
+        },
+        cancel: async () => false,
+      };
+    };
+    installRunner(kernel, { agent, wait: async () => [], completion: async () => ({ wait: async () => "d" }) });
+    const run = kernel.run(compileFanoutProgram(spec, { groupId: "tg-concurrency" }));
+    for (let index = 0; index < 5; index++) {
+      for (let attempt = 0; pending.length === 0 && attempt < 100; attempt++) await Promise.resolve();
+      expect(pending.length).toBeGreaterThan(0);
+      const next = pending.shift();
+      if (!next) throw new Error("expected a pending fanout handle");
+      next.resolve("result:" + next.label);
+    }
+    await run;
+    const payload = lastEvalPayload(kernel);
+
+    expect(maximumActive).toBeLessThanOrEqual(2);
+    expect(spawned).toBe(5);
+    expect(payload.outcomes).toHaveLength(5);
+    expect(payload.outcomes.every((outcome) => outcome.status === "succeeded")).toBe(true);
   });
 
   test("summarize mode runs completion() over inline results and reports summary", async () => {
@@ -325,61 +827,938 @@ describe("compiled program execution (mocked kernel)", () => {
     expect(kernel.completionPrompts[0]).toContain("gamma-res");
   });
 
-  test("pool program executes and recovers aggregate items into outcomes", async () => {
+  test("pool recovers each item from the public peek batch output", async () => {
     const spec = validateSpec({
       context: "Ctx",
       join: { mode: "all" },
-      tasks: [
-        { name: "w0", agent: "sonic", task: "W0" },
-        { name: "w1", agent: "sonic", task: "W1" },
-        { name: "w2", agent: "sonic", task: "W2" },
-        { name: "w3", agent: "sonic", task: "W3" },
-        { name: "w4", agent: "sonic", task: "W4" },
-        { name: "w5", agent: "sonic", task: "W5" },
-      ],
+      output: { mode: "summarize" },
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `w${i}`, agent: "sonic", task: `W${i}` })),
     });
-    const program = compilePoolProgram(spec, { groupId: "tg-pool" });
+    const program = compilePoolProgram(spec, { groupId: "tg-pool", summarize: { model: "smol" } });
     const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
-    const aggregateText = [
-      "Pool `tg-pool` completed — 6/6 items.",
-      ...spec.tasks.map((_t, i) => `- [tg-pool#${i + 1}] completed — task ${i}\n\`\`\`json\n{"tg-pool#${i + 1}":"pool-res-${i}"}\n\`\`\``),
-    ].join("\n");
+    const ids = Array.from({ length: 6 }, (_, i) => `tg-pool#${i + 1}`);
+    const values: unknown[] = [
+      "pool-res-0",
+      { verdict: "ok", score: 9, error: "business field" },
+      undefined,
+      "```json\n{\"fenced\":true}\n```",
+      null,
+      false,
+    ];
+    const encoded = (i: number): Record<string, unknown> =>
+      i === 2
+        ? { error: "worker rejected item" }
+        : { status: "succeeded", value: values[i] };
+    const firstOutput = JSON.stringify({
+      [ids[0] as string]: JSON.stringify(encoded(0)),
+      [ids[1] as string]: encoded(1),
+      [ids[2] as string]: encoded(2),
+    }, null, 2);
+    const secondOutput = JSON.stringify({
+      [ids[3] as string]: encoded(3),
+      [ids[4] as string]: encoded(4),
+      [ids[5] as string]: encoded(5),
+    }, null, 2);
+    let pushed = false;
+    let settled = false;
+    let waitCalls = 0;
     const pool = {
-      name: "tg-pool",
-      status: async () => ({ closed: true, items: { queued: 0, running: 0, completed: 6, failed: 0, cancelled: 0 }, agents: [] }),
-      push: (...items: unknown[]) => items.map((_, i) => `tg-pool#${i + 1}`),
-      close: async () => {},
+      push: (...items: string[]) => {
+        expect(items).toHaveLength(6);
+        pushed = true;
+        return ids;
+      },
+      status: async () => ({
+        name: "tg-pool",
+        agent: "sonic",
+        limit: 2,
+        closed: settled,
+        freshAgents: false,
+        agents: [],
+        items: !pushed
+          ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 }
+          : settled
+            ? { queued: 0, running: 0, completed: 5, failed: 1, cancelled: 0 }
+            : { queued: 3, running: 3, completed: 0, failed: 0, cancelled: 0 },
+        batches: !pushed ? 0 : settled ? 2 : 1,
+      }),
+      peek: async () => ({
+        batches: !pushed
+          ? []
+          : settled
+            ? [
+                { id: "worker-a-b1", agent: "worker-a", items: ids.slice(0, 3), status: "completed", output: firstOutput },
+                { id: "worker-b-b1", agent: "worker-b", items: ids.slice(3), status: "completed", output: secondOutput },
+              ]
+            : [
+                { id: "worker-a-b1", agent: "worker-a", items: ids.slice(0, 3), status: "completed", output: firstOutput },
+              ],
+        pending: !pushed ? 0 : settled ? 0 : 3,
+      }),
+      close: async () => ({ dropped: [] as string[] }),
     };
-    const tool = {
-      hub: async (args: { op: string }) =>
-        args.op === "wait" ? { text: aggregateText } : { text: "", details: { jobs: [] } },
-    };
+    const poolOptions: Array<{ agent: string; options: Record<string, unknown> }> = [];
+    const waitResults = [
+      { details: { op: "wait", jobs: [] } },
+      { details: { op: "wait", jobs: [{ id: "tg-pool", status: "running" }, { id: "worker-a-b1", status: "completed" }] } },
+      { details: { op: "wait", jobs: [{ id: "tg-pool", status: "completed" }, { id: "worker-b-b1", status: "completed" }] } },
+    ];
+    const tool = Object.assign(async () => ({}), {
+      read: async ({ path }: { path: string }) => {
+        expect(path).toBe("proc://");
+        return { details: { proc: { jobs: [], agents: [], daemons: [] } } };
+      },
+      wait: async () => {
+        const result = waitResults[Math.min(waitCalls, waitResults.length - 1)];
+        waitCalls++;
+        if (waitCalls === 3) settled = true;
+        return result;
+      },
+      write: async () => ({ content: [{ type: "text", text: "cancelled" }] }),
+    });
     const fns: FnMap = {
       agent: async () => {
         throw new Error("no agent in pool");
       },
       wait: async () => [],
-      completion: async () => ({ wait: async () => "d" }),
-      workpool: async () => pool,
+      completion: async (prompt: string) => {
+        kernel.completionPrompts.push(prompt);
+        return { wait: async () => "digest-mock" };
+      },
+      workpool: async (agent: string, options: Record<string, unknown>) => {
+        poolOptions.push({ agent, options });
+        return pool;
+      },
       tool,
     };
     installRunner(kernel, fns);
     await kernel.run(program);
     const payload = lastEvalPayload(kernel);
-    expect(payload.protocol).toBe(EVAL_RESULT_PROTOCOL);
-    expect(payload.groupId).toBe("tg-pool");
+
     expect(payload.strategy).toBe("pool");
     expect(payload.groupState).toBe("completed");
     expect(payload.outcomes).toHaveLength(6);
-    for (let i = 0; i < 6; i++) {
-      const o = byName(payload, `w${i}`);
-      expect(o.status).toBe("succeeded");
-      expect(o.result).toBe(`pool-res-${i}`);
-      expect(o.handle).toBe(`agent://tg-pool-${i + 1}`);
+    expect(waitCalls).toBe(3);
+    expect(poolOptions).toEqual([{ agent: "sonic", options: { name: "tg-pool", context: "Ctx" } }]);
+    expect(byName(payload, "w0")).toMatchObject({ status: "succeeded", result: "pool-res-0", handle: "agent://worker-a" });
+    expect(byName(payload, "w1")).toMatchObject({ status: "succeeded", structured: { verdict: "ok", score: 9, error: "business field" }, handle: "agent://worker-a" });
+    expect(byName(payload, "w2")).toMatchObject({ status: "failed", error: "worker rejected item", handle: "agent://worker-a" });
+    expect(byName(payload, "w3")).toMatchObject({ status: "succeeded", result: "```json\n{\"fenced\":true}\n```", handle: "agent://worker-b" });
+    expect(byName(payload, "w4")).toMatchObject({ status: "succeeded", structured: null, handle: "agent://worker-b" });
+    expect(byName(payload, "w5")).toMatchObject({ status: "succeeded", structured: false, handle: "agent://worker-b" });
+    for (const outcome of payload.outcomes) {
+      expect(outcome.durationMs).toBeUndefined();
+      expect(outcome.resolvedModel).toBeUndefined();
     }
-    expect(payload.rawChildChars).toBe(60); // 6 × "pool-res-N" (10 chars)
-    expect(kernel.phases.some((p) => p.includes("items pushed: 6"))).toBe(true);
-    expect(kernel.phases.some((p) => p.includes("draining"))).toBe(true);
+    expect(payload.rawChildChars).toBe(
+      "pool-res-0".length +
+        JSON.stringify(values[1]).length +
+        "```json\n{\"fenced\":true}\n```".length +
+        JSON.stringify(null).length +
+        JSON.stringify(false).length,
+    );
+    expect(payload.summary).toBe("digest-mock");
+    expect(kernel.completionPrompts).toHaveLength(1);
+  });
+
+  test("Pool preserves peer messages with the public Wait result shape during service wakes", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      join: { mode: "all" },
+      tasks: [
+        { name: "service-a", agent: "sonic", task: "A" },
+        { name: "service-b", agent: "sonic", task: "B" },
+      ],
+    });
+    const groupId = "tg-live-service";
+    const ids = [`${groupId}#1`, `${groupId}#2`];
+    const output = JSON.stringify({
+      [ids[0] as string]: { status: "succeeded", value: "A" },
+      [ids[1] as string]: { status: "succeeded", value: "B" },
+    });
+    let pushed = false;
+    let waitCalls = 0;
+    const pool = {
+      push: (...items: string[]) => {
+        expect(waitCalls).toBe(0);
+        pushed = true;
+        expect(items).toHaveLength(2);
+        return ids;
+      },
+      status: async () => ({
+        name: groupId,
+        agent: "sonic",
+        limit: 2,
+        closed: pushed && waitCalls >= 2,
+        freshAgents: false,
+        agents: [],
+        items: pushed
+          ? { queued: 0, running: 0, completed: 2, failed: 0, cancelled: 0 }
+          : { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 },
+        batches: pushed ? 1 : 0,
+      }),
+      peek: async () => ({
+        batches: pushed
+          ? [{ id: "worker-service-b1", agent: "worker-service", items: ids, status: "completed", output }]
+          : [],
+        pending: 0,
+      }),
+      close: async () => ({ dropped: [] as string[] }),
+    };
+    const tool = Object.assign(async () => ({}), {
+      read: async ({ path }: { path: string }) => {
+        expect(path).toBe("proc://");
+        return {
+          details: {
+            proc: {
+              jobs: pushed
+                ? [{ id: groupId, status: "running" }, { id: "worker-service-b1", status: "running" }]
+                : [],
+              agents: [],
+              daemons: [{ id: "live-service" }],
+            },
+          },
+        };
+      },
+      wait: async () => {
+        waitCalls++;
+        if (waitCalls === 1) {
+          return {
+            text: "[peer-message] helper: independent update",
+            details: { op: "wait", from: "parent", waited: { id: "peer-message", from: "helper", body: "independent update" } },
+          };
+        }
+        return {
+          details: {
+            op: "wait",
+            jobs: [{ id: groupId, status: "completed" }, { id: "worker-service-b1", status: "completed" }],
+          },
+        };
+      },
+      write: async () => {
+        throw new Error("successful Pool must not cancel jobs");
+      },
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let agentCalls = 0;
+    installRunner(kernel, {
+      agent: async () => {
+        agentCalls++;
+        throw new Error("a live service must not force Fanout");
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async (_agent: string, options: Record<string, unknown>) => {
+        expect(options).toEqual({ name: groupId, context: "Ctx" });
+        return pool;
+      },
+      tool,
+    });
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.strategy).toBe("pool");
+    expect(payload.groupState).toBe("failed");
+    expect(payload.groupError).toContain("peer message consumed while joining Pool");
+    expect(payload.groupError).toContain("independent update");
+    expect(payload.outcomes).toHaveLength(2);
+    expect(byName(payload, "service-a").status).toBe("succeeded");
+    expect(byName(payload, "service-b").status).toBe("succeeded");
+    expect(waitCalls).toBe(2);
+    expect(agentCalls).toBe(0);
+  });
+
+  test("pool falls back before creation when another owned job can win wait()", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `f${i}`, agent: "sonic", task: `F${i}` })),
+    });
+    const program = compilePoolProgram(spec, { groupId: "tg-busy" });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    const fns: FnMap = {};
+    let workpoolCalls = 0;
+    fns.agent = async (_prompt: string, opts: { label: string }) => ({
+      handle: `agent://${opts.label}`,
+      wait: async () => `result:${opts.label}`,
+      cancel: async () => {},
+    });
+    fns.wait = async () => [];
+    fns.completion = async () => ({ wait: async () => "digest" });
+    fns.workpool = async () => {
+      workpoolCalls++;
+      throw new Error("must not start a pool beside another job");
+    };
+    fns.tool = Object.assign(async () => ({}), {
+      read: async () => ({
+        details: { proc: { jobs: [{ id: "other-job", status: "running" }], agents: [], daemons: [] } },
+      }),
+    });
+    installRunner(kernel, fns);
+    await kernel.run(program);
+    const payload = lastEvalPayload(kernel);
+    expect(payload.strategy).toBe("fanout");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(payload.fallbackReason).toContain("other-job");
+    expect(workpoolCalls).toBe(0);
+  });
+  test("Pool preflight preserves a consumed peer message before falling back", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `pm${i}`, agent: "sonic", task: `PM${i}` })),
+    });
+    const groupId = "tg-peer-preflight";
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let waitCalls = 0;
+    let workpoolCalls = 0;
+    const fns: FnMap = {
+      agent: async (_prompt: string, opts: { label: string }) => ({
+        handle: `agent://${opts.label}`,
+        wait: async () => `result:${opts.label}`,
+        cancel: async () => {},
+      }),
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => {
+        workpoolCalls++;
+        throw new Error("preflight message must prevent Pool creation");
+      },
+      tool: Object.assign(async () => ({}), {
+        read: async () => ({ details: { proc: { jobs: [], agents: [], daemons: [] } } }),
+        wait: async () => {
+          waitCalls++;
+          return {
+            text: "[peer-7] helper: please check the new input",
+            details: {
+              op: "wait",
+              from: "main",
+              waited: { id: "peer-7", from: "helper", body: "please check the new input" },
+            },
+          };
+        },
+      }),
+    };
+    installRunner(kernel, fns);
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.strategy).toBe("fanout");
+    expect(payload.fallbackReason).toContain("please check the new input");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(payload.outcomes.every((outcome) => outcome.status === "succeeded")).toBe(true);
+    expect(waitCalls).toBe(1);
+    expect(workpoolCalls).toBe(0);
+  });
+  test("Pool falls back when proc inventory reports unavailable services", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `svc${i}`, agent: "sonic", task: `SVC${i}` })),
+    });
+    const groupId = "tg-services-unavailable";
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let waitCalls = 0;
+    let workpoolCalls = 0;
+    installRunner(kernel, {
+      agent: async (_prompt: string, opts: { label: string }) => ({
+        handle: `agent://${opts.label}`,
+        wait: async () => `result:${opts.label}`,
+        cancel: async () => {},
+      }),
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => {
+        workpoolCalls++;
+        throw new Error("unverifiable proc inventory must not start Pool");
+      },
+      tool: Object.assign(async () => ({}), {
+        read: async () => ({
+          text: "Services unavailable",
+          details: { proc: { jobs: [], agents: [], daemons: [] } },
+        }),
+        wait: async () => {
+          waitCalls++;
+          return { details: { op: "wait", jobs: [] } };
+        },
+      }),
+    });
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.strategy).toBe("fanout");
+    expect(payload.fallbackReason).toContain("could not verify caller-owned services");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(workpoolCalls).toBe(0);
+    expect(waitCalls).toBe(0);
+  });
+  test("Pool worker failures stay failures instead of inheriting batch success", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `e${i}`, agent: "sonic", task: `E${i}` })),
+    });
+    const groupId = "tg-worker-error";
+    const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+    let pushed = false;
+    const pool = {
+      push: (...items: string[]) => {
+        pushed = true;
+        expect(items).toHaveLength(6);
+        return ids;
+      },
+      status: async () => ({
+        name: groupId,
+        agent: "sonic",
+        limit: 2,
+        closed: pushed,
+        freshAgents: false,
+        agents: [],
+        items: pushed
+          ? { queued: 0, running: 0, completed: 0, failed: 6, cancelled: 0 }
+          : { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 },
+        batches: pushed ? 1 : 0,
+      }),
+      peek: async () => ({
+        batches: pushed
+          ? [{ id: "worker-bad-b1", agent: "worker-bad", items: ids, status: "failed", output: "worker crashed before result" }]
+          : [],
+        pending: 0,
+      }),
+      close: async () => ({ dropped: [] as string[] }),
+    };
+    let waitCalls = 0;
+    let workpoolCalls = 0;
+    const tool = Object.assign(async () => ({}), {
+      read: async () => ({ details: { proc: { jobs: [], agents: [], daemons: [] } } }),
+      wait: async () => {
+        waitCalls++;
+        return { details: { op: "wait", jobs: waitCalls === 1 ? [] : [{ id: groupId, status: "completed" }] } };
+      },
+      write: async () => ({ details: { proc: { cancelled: [{ id: groupId, status: "cancelled" }] } } }),
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    const fns: FnMap = {
+      agent: async () => {
+        throw new Error("Pool batch failures must not rerun as Fanout");
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => {
+        workpoolCalls++;
+        return pool;
+      },
+      tool,
+    };
+    installRunner(kernel, fns);
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.strategy).toBe("pool");
+    expect(payload.groupState).toBe("failed");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(payload.outcomes.every((outcome) => outcome.status === "failed")).toBe(true);
+    expect(workpoolCalls).toBe(1);
+    expect(waitCalls).toBe(2);
+  });
+
+  test("Pool rejects truncated and incomplete batch output without claiming success", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `m${i}`, agent: "sonic", task: `M${i}` })),
+    });
+    const groupId = "tg-missing-output";
+    const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+    let pushed = false;
+    const pool = {
+      push: () => {
+        pushed = true;
+        return ids;
+      },
+      status: async () => ({
+        name: groupId,
+        agent: "sonic",
+        limit: 2,
+        closed: pushed,
+        freshAgents: false,
+        agents: [],
+        items: pushed
+          ? { queued: 0, running: 0, completed: 6, failed: 0, cancelled: 0 }
+          : { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 },
+        batches: pushed ? 2 : 0,
+      }),
+      peek: async () => ({
+        batches: pushed
+          ? [
+              {
+                id: "worker-truncated-b1",
+                agent: "worker-truncated",
+                items: ids.slice(0, 3),
+                status: "completed",
+                output: "{",
+              },
+              {
+                id: "worker-duplicate-b2",
+                agent: "worker-duplicate",
+                items: [ids[3] as string, ids[4] as string, ids[4] as string],
+                status: "completed",
+                output: JSON.stringify({
+                  [ids[3] as string]: { status: "succeeded", value: "M3" },
+                  [ids[4] as string]: { status: "succeeded", value: "M4" },
+                }, null, 2),
+              },
+            ]
+          : [],
+        pending: 0,
+      }),
+      close: async () => ({ dropped: [] as string[] }),
+    };
+    let waitCalls = 0;
+    const tool = Object.assign(async () => ({}), {
+      read: async () => ({ details: { proc: { jobs: [], agents: [], daemons: [] } } }),
+      wait: async () => ({
+        details: {
+          op: "wait",
+          jobs: waitCalls++ === 0 ? [] : [{ id: groupId, status: "completed" }],
+        },
+      }),
+      write: async () => ({ details: { proc: { cancelled: [{ id: groupId, status: "cancelled" }] } } }),
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    installRunner(kernel, {
+      agent: async () => {
+        throw new Error("Truncated Pool output must not rerun as Fanout");
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => pool,
+      tool,
+    });
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.strategy).toBe("pool");
+    expect(payload.groupState).toBe("failed");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(payload.outcomes.every((outcome) => outcome.status === "failed")).toBe(true);
+    expect(payload.groupError).toContain("status count for completed");
+    expect(byName(payload, "m0").error).toContain("invalid or truncated JSON");
+    expect(byName(payload, "m3").error).toContain("did not cover exactly");
+    expect(byName(payload, "m4").error).toContain("duplicated item");
+    expect(byName(payload, "m5").error).toContain("omitted item");
+    expect(waitCalls).toBe(2);
+  });
+
+  test("Pool rejects duplicate JSON object keys instead of accepting parser overwrite", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `d${i}`, agent: "sonic", task: `D${i}` })),
+    });
+    const groupId = "tg-duplicate-json-keys";
+    const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+    const entries = ids.map((id, index) =>
+      JSON.stringify(id) + ":" + JSON.stringify({ status: "succeeded", value: `D${index}` }),
+    );
+    const output = `{${[entries[0], entries[0], ...entries.slice(1)].join(",")}}`;
+    let pushed = false;
+    const pool = {
+      push: () => {
+        pushed = true;
+        return ids;
+      },
+      status: async () => ({
+        name: groupId,
+        agent: "sonic",
+        limit: 2,
+        closed: pushed,
+        freshAgents: false,
+        agents: [],
+        items: pushed
+          ? { queued: 0, running: 0, completed: 6, failed: 0, cancelled: 0 }
+          : { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 },
+        batches: pushed ? 1 : 0,
+      }),
+      peek: async () => ({
+        batches: pushed
+          ? [{ id: "worker-duplicate-json", agent: "worker-duplicate-json", items: ids, status: "completed", output }]
+          : [],
+        pending: 0,
+      }),
+      close: async () => ({ dropped: [] as string[] }),
+    };
+    let waitCalls = 0;
+    const tool = Object.assign(async () => ({}), {
+      read: async () => ({ details: { proc: { jobs: [], agents: [], daemons: [] } } }),
+      wait: async () => ({
+        details: { op: "wait", jobs: waitCalls++ === 0 ? [] : [{ id: groupId, status: "completed" }] },
+      }),
+      write: async () => ({ details: { proc: { cancelled: [{ id: groupId, status: "cancelled" }] } } }),
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let agentCalls = 0;
+    installRunner(kernel, {
+      agent: async () => {
+        agentCalls++;
+        throw new Error("duplicate Pool JSON must not rerun as Fanout");
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => pool,
+      tool,
+    });
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.groupState).toBe("failed");
+    expect(payload.groupError).toContain("duplicate JSON object keys");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(payload.outcomes.every((outcome) => outcome.status === "failed")).toBe(true);
+    expect(agentCalls).toBe(0);
+    expect(waitCalls).toBe(2);
+  });
+
+  test("invalid push mapping cancels and reaps dispatched work without rerunning", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `p${i}`, agent: "sonic", task: `P${i}` })),
+    });
+    const groupId = "tg-partial-push";
+    const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+    let pushed = false;
+    let closed = false;
+    const pool = {
+      push: () => {
+        pushed = true;
+        return ids.slice(0, 1);
+      },
+      status: async () => ({
+        name: groupId,
+        agent: "sonic",
+        limit: 2,
+        closed,
+        freshAgents: false,
+        agents: [],
+        items: !pushed
+          ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 }
+          : closed
+            ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 1 }
+            : { queued: 1, running: 0, completed: 0, failed: 0, cancelled: 0 },
+        batches: 0,
+      }),
+      peek: async () => ({ batches: [], pending: pushed && !closed ? 1 : 0 }),
+      close: async () => {
+        closed = true;
+        return { dropped: [ids[0]] };
+      },
+    };
+    let waitCalls = 0;
+    let writeCalls = 0;
+    const tool = Object.assign(async () => ({}), {
+      read: async () => ({
+        details: {
+          proc: {
+            jobs: pushed ? [{ id: groupId, status: "cancelled", errorText: "pool cancelled" }] : [],
+            agents: [],
+            daemons: [],
+          },
+        },
+      }),
+      wait: async () => ({
+        details: { op: "wait", jobs: waitCalls++ === 0 ? [] : [{ id: groupId, status: "cancelled" }] },
+      }),
+      write: async () => {
+        writeCalls++;
+        return { details: { proc: { cancelled: [{ id: groupId, status: "cancelled" }] } } };
+      },
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let agentCalls = 0;
+    installRunner(kernel, {
+      agent: async () => {
+        agentCalls++;
+        throw new Error("partially submitted Pool must not rerun as Fanout");
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => pool,
+      tool,
+    });
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.strategy).toBe("pool");
+    expect(payload.groupState).toBe("cancelled");
+    expect(payload.groupError).toContain("did not return one unique item id per task");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(byName(payload, "p0").status).toBe("cancelled");
+    expect(payload.outcomes.filter((outcome) => outcome.status === "failed")).toHaveLength(5);
+    expect(agentCalls).toBe(0);
+    expect(waitCalls).toBe(2);
+    expect(writeCalls).toBe(1);
+  });
+
+  test("Pool returns after cancellation instead of parking on an owned service", async () => {
+    const spec = validateSpec({
+      context: "Ctx",
+      tasks: Array.from({ length: 6 }, (_, i) => ({ name: `i${i}`, agent: "sonic", task: `I${i}` })),
+    });
+    const groupId = "tg-idle-after-cancel";
+    const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+    let pushed = false;
+    let closed = false;
+    const pool = {
+      push: () => {
+        pushed = true;
+        return ids;
+      },
+      status: async () => ({
+        name: groupId,
+        agent: "sonic",
+        limit: 2,
+        closed,
+        freshAgents: false,
+        agents: [],
+        items: !pushed
+          ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 }
+          : closed
+            ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 6 }
+            : { queued: 6, running: 0, completed: 0, failed: 0, cancelled: 0 },
+        batches: 0,
+      }),
+      peek: async () => ({ batches: [], pending: pushed && !closed ? 6 : 0 }),
+      close: async () => {
+        closed = true;
+        return { dropped: ids };
+      },
+    };
+    let waitCalls = 0;
+    let writeCalls = 0;
+    const tool = Object.assign(async () => ({}), {
+      read: async () => ({
+        details: { proc: { jobs: [], agents: [], daemons: [{ id: "live-service" }] } },
+      }),
+      wait: async () => {
+        waitCalls++;
+        return { details: { op: "wait", interrupted: true } };
+      },
+      write: async () => {
+        writeCalls++;
+        return { details: { proc: { cancelled: [{ id: groupId, status: "cancelled" }] } } };
+      },
+    });
+    const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+    let agentCalls = 0;
+    installRunner(kernel, {
+      agent: async () => {
+        agentCalls++;
+        throw new Error("Pool with no waitable job must not rerun as Fanout");
+      },
+      wait: async () => [],
+      completion: async () => ({ wait: async () => "digest" }),
+      workpool: async () => pool,
+      tool,
+    });
+    await kernel.run(compilePoolProgram(spec, { groupId }));
+    const payload = lastEvalPayload(kernel);
+
+    expect(payload.groupState).toBe("cancelled");
+    expect(payload.groupError).toContain("no waitable aggregate or batch job");
+    expect(payload.outcomes).toHaveLength(6);
+    expect(payload.outcomes.every((outcome) => outcome.status === "cancelled")).toBe(true);
+    expect(waitCalls).toBe(1);
+    expect(writeCalls).toBe(1);
+    expect(agentCalls).toBe(0);
+  });
+
+  test("Pool bounds repeated Wait calls when cancellation leaves its aggregate running", async () => {
+    vi.useFakeTimers();
+    try {
+      const spec = validateSpec({
+        context: "Ctx",
+        tasks: Array.from({ length: 6 }, (_, i) => ({ name: `r${i}`, agent: "sonic", task: `R${i}` })),
+      });
+      const groupId = "tg-stuck-cancel";
+      const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+      const waitGate = Promise.withResolvers<unknown>();
+      let pushed = false;
+      let closed = false;
+      let waitCalls = 0;
+      let writeCalls = 0;
+      const pool = {
+        push: () => {
+          pushed = true;
+          return ids;
+        },
+        status: async () => ({
+          name: groupId,
+          agent: "sonic",
+          limit: 2,
+          closed,
+          freshAgents: false,
+          agents: [],
+          items: !pushed
+            ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 }
+            : { queued: 0, running: 6, completed: 0, failed: 0, cancelled: 0 },
+          batches: pushed ? 1 : 0,
+        }),
+        peek: async () => ({
+          batches: pushed
+            ? [{ id: "worker-stuck-b1", agent: "worker-stuck", items: ids, status: "running" }]
+            : [],
+          pending: pushed ? 6 : 0,
+        }),
+        close: async () => {
+          closed = true;
+          return { dropped: [] as string[] };
+        },
+      };
+      const tool = Object.assign(async () => ({}), {
+        read: async () => ({
+          details: {
+            proc: {
+              jobs: pushed
+                ? [{ id: groupId, status: "running" }, { id: "worker-stuck-b1", status: "running" }]
+                : [],
+              agents: [],
+              daemons: [{ id: "live-service" }],
+            },
+          },
+        }),
+        wait: async () => {
+          waitCalls++;
+          return waitCalls === 1
+            ? waitGate.promise
+            : {
+                details: {
+                  op: "wait",
+                  jobs: [{ id: groupId, status: "running" }, { id: "worker-stuck-b1", status: "running" }],
+                },
+              };
+        },
+        write: async () => {
+          writeCalls++;
+          waitGate.resolve({
+            details: {
+              op: "wait",
+              jobs: [{ id: groupId, status: "running" }, { id: "worker-stuck-b1", status: "running" }],
+            },
+          });
+          return { details: { proc: { cancelled: [{ id: groupId, status: "cancelled" }] } } };
+        },
+      });
+      const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+      let agentCalls = 0;
+      installRunner(kernel, {
+        agent: async () => {
+          agentCalls++;
+          throw new Error("stuck Pool must not rerun as Fanout");
+        },
+        wait: async () => [],
+        completion: async () => ({ wait: async () => "digest" }),
+        workpool: async () => pool,
+        tool,
+      });
+      const run = kernel.run(compilePoolProgram(spec, { groupId, maxGroupMs: 10 }));
+      for (let spin = 0; spin < 100 && waitCalls < 1; spin++) await Promise.resolve();
+      expect(waitCalls).toBe(1);
+      vi.advanceTimersByTime(10);
+      await run;
+      const payload = lastEvalPayload(kernel);
+
+      expect(payload.groupState).toBe("failed");
+      expect(payload.groupError).toContain("bounded cancellation waits");
+      expect(payload.outcomes).toHaveLength(6);
+      expect(payload.outcomes.every((outcome) => outcome.status === "failed")).toBe(true);
+      expect(waitCalls).toBe(2);
+      expect(writeCalls).toBe(1);
+      expect(agentCalls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("Pool timeout closes queued work, kills the aggregate job, and does not rerun tasks", async () => {
+    vi.useFakeTimers();
+    try {
+      const spec = validateSpec({
+        context: "Ctx",
+        tasks: Array.from({ length: 6 }, (_, i) => ({ name: `c${i}`, agent: "sonic", task: `C${i}` })),
+      });
+      const groupId = "tg-pool-timeout";
+      const ids = Array.from({ length: 6 }, (_, i) => `${groupId}#${i + 1}`);
+      const waitGate = Promise.withResolvers<unknown>();
+      let pushed = false;
+      let closed = false;
+      let waitCalls = 0;
+      let writeCalls = 0;
+      const pool = {
+        push: () => {
+          pushed = true;
+          return ids;
+        },
+        status: async () => ({
+          name: groupId,
+          agent: "sonic",
+          limit: 2,
+          closed,
+          freshAgents: false,
+          agents: [],
+          items: !pushed
+            ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 }
+            : closed
+              ? { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 6 }
+              : { queued: 6, running: 0, completed: 0, failed: 0, cancelled: 0 },
+          batches: 0,
+        }),
+        peek: async () => ({ batches: [], pending: closed ? 0 : pushed ? 6 : 0 }),
+        close: async () => {
+          closed = true;
+          return { dropped: ids };
+        },
+      };
+      const tool = Object.assign(async () => ({}), {
+        read: async () => ({ details: { proc: { jobs: [], agents: [], daemons: [] } } }),
+        wait: async () => {
+          waitCalls++;
+          return waitCalls === 1 ? { details: { op: "wait", jobs: [] } } : waitGate.promise;
+        },
+        write: async ({ path }: { path: string }) => {
+          writeCalls++;
+          expect(path).toBe(`proc://${groupId}/kill`);
+          waitGate.resolve({ details: { op: "wait", jobs: [{ id: groupId, status: "cancelled" }] } });
+          return { details: { proc: { op: "cancel", jobs: [], cancelled: [{ id: groupId, status: "cancelled" }] } } };
+        },
+      });
+      const kernel: MockKernel = { consoleValues: [], phases: [], completionPrompts: [], run: async () => {} };
+      let workpoolCalls = 0;
+      let agentCalls = 0;
+      installRunner(kernel, {
+        agent: async () => {
+          agentCalls++;
+          throw new Error("Pool timeout must not rerun tasks as Fanout");
+        },
+        wait: async () => [],
+        completion: async () => ({ wait: async () => "digest" }),
+        workpool: async () => {
+          workpoolCalls++;
+          return pool;
+        },
+        tool,
+      });
+      const run = kernel.run(compilePoolProgram(spec, { groupId, maxGroupMs: 25 }));
+      for (let attempt = 0; waitCalls < 2 && attempt < 100; attempt++) await Promise.resolve();
+      expect(waitCalls).toBe(2);
+      vi.advanceTimersByTime(25);
+      await run;
+      const payload = lastEvalPayload(kernel);
+
+      expect(payload.strategy).toBe("pool");
+      expect(payload.groupState).toBe("failed");
+      expect(payload.groupError).toContain("maxGroupMs");
+      expect(payload.outcomes).toHaveLength(6);
+      expect(payload.outcomes.every((outcome) => outcome.status === "cancelled")).toBe(true);
+      expect(workpoolCalls).toBe(1);
+      expect(agentCalls).toBe(0);
+      expect(writeCalls).toBe(1);
+      expect(waitCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   test("fanout emits its completed result through OMP's console JSON view without a display global", async () => {
     const logged: unknown[] = [];
@@ -404,7 +1783,7 @@ describe("compiled program execution (mocked kernel)", () => {
       async () => { throw new Error("unexpected workpool"); },
       { log: (...values: unknown[]) => logged.push(...values) },
       () => {},
-      { hub: async () => ({ text: "", details: { jobs: [] } }) },
+      {},
     );
 
     await run();

@@ -4,7 +4,7 @@
 independent subagents, join, and return **exactly one logical result** to the parent.
 Not a workflow engine: no DAG, no `depends_on`, no pipeline, no loop, no resume.
 
-Works with OMP v18.12.x. Zero runtime dependencies; public API only.
+Targets OMP's documented Eval API audited against v18.16.0. Zero runtime dependencies; public API only.
 
 ## What it does
 
@@ -81,8 +81,10 @@ isolation, `tools` for kernel-tool exposure, `effort` (forward-compatible).
 
 ### Output modes (Result Gate)
 
-- `compact` — per-task glyph/status, clipped preview, duration + model, `agent://`
-  handle for the full transcript (handles preserved so nothing is lost).
+- `compact` — per-task glyph/status, clipped preview, and `agent://` handles.
+  Fanout records local per-task duration. The current public Eval API does not
+  expose a resolved model per AgentHandle; Workpool also omits per-item duration,
+  so those fields are not fabricated.
 - `structured` — one JSON aggregate of per-task structured outputs.
 - `summarize` — stateless `completion()` digest (opt-in via config), falls back to
   compact on failure.
@@ -92,13 +94,29 @@ isolation, `tools` for kernel-tool exposure, `effort` (forward-compatible).
 ### Strategies
 
 - `fanout` — per-child agents with per-handle waits, all inside the single eval
-  cell; child deliveries are consumed exactly once there, so the parent sees only
-  the one native eval result (no re-delivery wakes).
-- `pool` — one workpool for large homogeneous batches (`join=all + collect`, all
-  tasks same agent/isolation/tools/schema, count ≥ threshold). Coarse progress;
-  per-item results recovered from the aggregate; automatic fallback to fanout on
-  any mismatch.
-- `auto` (default) picks between them; `/task-group explain` shows the decision trace.
+  cell; each handle result is consumed exactly once, so the parent sees one
+  native eval result.
+- `pool` — one Workpool for large homogeneous `all + collect` batches. The compiler uses
+  `workpool(agent, { name, context, tools })`, `pool.status()`, `pool.peek()`,
+  and the ordinary `tool.wait()` tool; it does not use kernel `wait(handles)`
+  or poll for completion. Every pushed item needs one unique returned ID and
+  one matching key in the batch JSON output; duplicate JSON keys, missing or
+  malformed results, pending items, and status-count mismatches fail closed.
+  A JSON-string-encoded envelope is decoded only when it parses to the exact
+  success/failure shape; markdown fences are never stripped or guessed.
+- Pool is ineligible for per-task schemas, isolation, or explicit per-group
+  concurrency. Runtime preflight falls back to Fanout before submission if the
+  public result/wait contract is unavailable or another caller-owned job or
+  live agent could win `wait()`. Existing services may produce intermediate
+  snapshots while a Pool job is active; they do not disable Pool.
+- Non-builtin Eval wrappers permit Pool only when every wrapper's public
+  `ToolInfo.description` contains `omp-task-group-pool-proc-cancel:v1`.
+  An unmarked wrapper or unavailable ToolInfo forces pre-dispatch Fanout;
+  `/task-group explain` records the reason. Once `push()` is attempted, errors
+  are canceled and reaped; tasks are never rerun.
+- `auto` (default) picks between them; `/task-group explain` shows static and
+  runtime fallback reasons. The capability report marks Workpool and Task Group
+  Pool as conditional until the active Eval runtime passes its preflight.
 
 ## Commands
 
@@ -186,13 +204,16 @@ bun run build
 
 ## Known limits
 
-- Per-child token counts are not exposed by OMP v18.12.x's public eval surface;
-  snapshots carry `null` tokens and budget-delta estimates in telemetry.
+- The current public Eval surface does not expose per-child token counts; snapshots
+  carry `null` tokens and telemetry uses budget-delta estimates.
 - No live per-task stream: the parent sees one final tool result. Output lines the
-  native eval cell may show while a group runs are ordinary cell output, not Task
-  Group transport — never rely on them as a per-task update channel.
-- The group cell renders through native eval's public tool UI (code + output); the
-  plugin cannot swap in a custom live renderer, so the joined digest is the
-  delivered content/details.
-- `effort` is accepted but inert until OMP exposes effort on eval `agent()`.
-- Pool strategy reports coarse (aggregate) progress while running.
+  native Eval cell may show while a group runs are ordinary cell output, not Task
+  Group transport.
+- The group cell uses native Eval's public tool UI (code + output); the plugin
+  cannot swap in a custom live renderer.
+- `effort` is accepted but inert until OMP exposes effort on Eval `agent()`.
+- Pool has no per-item duration or resolved-model fields in its public snapshot.
+  Unrecoverable batch output fails the group; tasks are not rerun after dispatch.
+- A steering-triggered Eval backgrounding cannot be prevented by the extension.
+  The result hook reports the foreground-barrier violation and Pool cancellation
+  is attempted; OMP still owns delivery of any backgrounded Eval job.

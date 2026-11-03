@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import taskGroupExtension from "../../src/index";
 import { EVAL_RESULT_PROTOCOL, EVAL_RESULT_TRANSPORT } from "../../src/compiler/program";
-import type { ExtensionAPI, ExtensionContext } from "../../src/types";
+import { TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY } from "../../src/capabilities";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../src/types";
 
 const SPEC = {
   context: "Shared.",
@@ -14,13 +15,34 @@ const SPEC = {
   ],
 };
 
+const SIX_TASK_SPEC = {
+  context: "Each child returns its assigned token.",
+  tasks: Array.from({ length: 6 }, (_, index) => ({
+    name: `task-${index + 1}`,
+    agent: "sonic",
+    task: `Return token-${index + 1}.`,
+  })),
+  join: { mode: "all" },
+  failure: { mode: "collect" },
+  execution: { strategy: "auto", concurrency: "auto" },
+};
+
+type ToolInventory = Array<{
+  name: string;
+  description?: string;
+  sourceInfo?: { source?: string };
+}>;
+type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>;
 
 interface Harness {
-  ctx: ExtensionContext;
+  ctx: ExtensionCommandContext;
   handlers: Map<string, Handler[]>;
   registeredTools: unknown[];
   entries: Array<{ customType: string; data: unknown }>;
+  commands: Map<string, CommandHandler>;
+  notices: string[];
   state: { aborts: number };
 }
 
@@ -28,16 +50,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function makeHarness(cwd: string): Harness {
+function makeHarness(
+  cwd: string,
+  toolInventory: ToolInventory = [{ name: "eval", description: "Native Eval", sourceInfo: { source: "builtin" } }],
+): Harness {
   const handlers = new Map<string, Handler[]>();
   const registeredTools: unknown[] = [];
   const entries: Array<{ customType: string; data: unknown }> = [];
+  const commands = new Map<string, CommandHandler>();
+  const notices: string[] = [];
   const state = { aborts: 0 };
-  const ctx: ExtensionContext = {
+  const ctx: ExtensionCommandContext = {
     ui: {
       setStatus: () => {},
       setWidget: () => {},
-      notify: () => {},
+      notify: (message) => notices.push(message),
       select: async () => undefined,
       confirm: async () => false,
     },
@@ -54,6 +81,7 @@ function makeHarness(cwd: string): Harness {
     abort: () => {
       state.aborts += 1;
     },
+    waitForIdle: async () => {},
   };
   const api = {
     on(event: string, handler: Handler): void {
@@ -64,14 +92,17 @@ function makeHarness(cwd: string): Harness {
     registerTool(tool: unknown): void {
       registeredTools.push(tool);
     },
-    registerCommand: () => {},
+    registerCommand(name: string, options: { handler: CommandHandler }): void {
+      commands.set(name, options.handler);
+    },
+    getAllTools: () => toolInventory,
     zod: {},
     appendEntry(customType: string, data?: unknown): void {
       entries.push({ customType, data });
     },
   } as unknown as ExtensionAPI;
   taskGroupExtension(api);
-  return { ctx, handlers, registeredTools, entries, state };
+  return { ctx, handlers, registeredTools, entries, commands, notices, state };
 }
 
 async function emit(harness: Harness, eventName: string, event: unknown): Promise<unknown> {
@@ -101,7 +132,10 @@ function groupIdFrom(input: Record<string, unknown>): string {
   return title.slice("task group: ".length);
 }
 
-async function withIsolatedHarness(run: (harness: Harness) => Promise<void>): Promise<void> {
+async function withIsolatedHarness(
+  run: (harness: Harness) => Promise<void>,
+  toolInventory?: ToolInventory,
+): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tg-envelope-hooks-"));
   const home = join(root, "home");
   const cwd = join(root, "project");
@@ -110,7 +144,7 @@ async function withIsolatedHarness(run: (harness: Harness) => Promise<void>): Pr
   const previousHome = process.env.HOME;
   process.env.HOME = home;
   try {
-    await run(makeHarness(cwd));
+    await run(makeHarness(cwd, toolInventory));
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -258,5 +292,68 @@ describe("standard eval envelope hooks", () => {
       const text = ((patch as Record<string, unknown>).content as Array<{ text: string }>)[0]?.text ?? "";
       expect(text).toContain("auto-backgrounded (bg-1)");
     });
+  });
+  test("wraps native Eval failures as explicit Task Group errors", async () => {
+    await withIsolatedHarness(async (harness) => {
+      const rewrite = await emit(harness, "tool_call", evalCall("native-error", envelope()));
+      const input = rewrittenInput(rewrite);
+      const patch = await emit(harness, "tool_result", {
+        type: "tool_result",
+        toolCallId: "native-error",
+        toolName: "eval",
+        input,
+        content: [{ type: "text", text: "ToolError: Unknown tool from js runtime: hub" }],
+        details: {},
+        isError: true,
+      });
+      expect(isRecord(patch)).toBe(true);
+      expect((patch as Record<string, unknown>).isError).toBe(true);
+      const text = ((patch as Record<string, unknown>).content as Array<{ text: string }>)[0]?.text ?? "";
+      expect(text).toContain("native eval failed");
+      expect(text).toContain("Unknown tool from js runtime: hub");
+    });
+  });
+
+  test("Pool accepts a marked Eval wrapper while built-in Eval needs no marker", async () => {
+    const inventory: ToolInventory = [
+      { name: "eval", description: "Native Eval", sourceInfo: { source: "builtin" } },
+      {
+        name: "eval",
+        description: `Smart Approve Eval capability ${TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY}`,
+        sourceInfo: { source: "extension" },
+      },
+    ];
+    await withIsolatedHarness(async (harness) => {
+      await emit(harness, "tool_call", evalCall("pool-marked", envelope(SIX_TASK_SPEC)));
+      const explain = harness.commands.get("task-group");
+      expect(explain).toBeDefined();
+      await explain!("explain", harness.ctx);
+      const message = harness.notices.at(-1) ?? "";
+      expect(message).toContain("strategy: pool");
+      expect(message).not.toContain("downgraded from pool");
+    }, inventory);
+  });
+
+
+  test("any unmarked Eval wrapper forces pre-dispatch Fanout and explains why", async () => {
+    const inventory: ToolInventory = [
+      { name: "eval", description: "Native Eval", sourceInfo: { source: "builtin" } },
+      {
+        name: "eval",
+        description: `Compatible wrapper ${TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY}`,
+        sourceInfo: { source: "extension" },
+      },
+      { name: "eval", description: "Unmarked Eval wrapper", sourceInfo: { source: "extension" } },
+    ];
+    await withIsolatedHarness(async (harness) => {
+      await emit(harness, "tool_call", evalCall("pool-unmarked", envelope(SIX_TASK_SPEC)));
+      const explain = harness.commands.get("task-group");
+      expect(explain).toBeDefined();
+      await explain!("explain", harness.ctx);
+      const message = harness.notices.at(-1) ?? "";
+      expect(message).toContain("strategy: fanout (Pool candidate downgraded:");
+      expect(message).toContain(TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY);
+      expect(message).toContain("using Fanout");
+    }, inventory);
   });
 });

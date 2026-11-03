@@ -13,7 +13,12 @@ import type { GroupEvent, TaskGroupSnapshot } from "../state/events";
 
 export interface BackendCapabilities {
   fanout: boolean;
+  /** OMP's native Eval prelude exposes workpool(). */
   workpool: boolean;
+  /** The compiler can attempt Pool and validates its public result contract at runtime. */
+  taskGroupPool: boolean;
+  /** Specific runtime reason when an Eval wrapper makes Pool unsafe. */
+  taskGroupPoolReason?: string;
   summarize: boolean;
   structured: boolean;
   joinAll: boolean;

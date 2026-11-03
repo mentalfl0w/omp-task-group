@@ -179,6 +179,11 @@ function decodePayload(
     if (typeof payload.groupError !== "string") fail("eval result payload groupError must be a string");
     groupError = payload.groupError;
   }
+  let fallbackReason: string | undefined;
+  if (payload.fallbackReason !== undefined) {
+    if (typeof payload.fallbackReason !== "string") fail("eval result payload fallbackReason must be a string");
+    fallbackReason = payload.fallbackReason;
+  }
   let summary: string | undefined;
   if (payload.summary !== undefined) {
     if (typeof payload.summary !== "string") fail("eval result payload summary must be a string");
@@ -207,6 +212,7 @@ function decodePayload(
     rawChildChars,
   };
   if (groupError !== undefined) result.groupError = groupError;
+  if (fallbackReason !== undefined) result.fallbackReason = fallbackReason;
   if (summary !== undefined) result.summary = summary;
   if (groupState === "cancelled") result.cancelled = true;
   return result;

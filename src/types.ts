@@ -1,10 +1,11 @@
 /**
  * omp-task-group — hand-written public API surface.
  *
- * Every type here mirrors a DOCUMENTED OMP public contract (docs/extensions.md,
- * docs/tools/eval.md, docs/tools/hub.md at v18.1.x). Nothing imports host
- * internals; nothing depends on @oh-my-pi packages at runtime. When OMP
- * evolves a shape, only this file needs review.
+ * Every type here mirrors documented OMP public contracts (docs/extensions.md,
+ * docs/tools/eval.md, docs/tools/wait.md, docs/tools/read.md for proc://) audited
+ * against the current v18.16.0 source. Nothing imports host internals; nothing
+ * depends on @oh-my-pi packages at runtime. When OMP evolves a shape, only this
+ * file needs review.
  */
 
 // ── Public tool result contract ──────────────────────────────────────
@@ -216,6 +217,8 @@ export interface SchemaBuilder {
 export interface ExtensionAPI {
   on<E extends keyof ExtensionEventMap>(event: E, handler: ExtensionEventHandler<E>): void;
   registerTool(tool: ToolDefinition): void;
+  /** Public tool inventory with provenance; used to detect Eval wrappers. */
+  getAllTools?(): Array<{ name: string; description?: string; sourceInfo?: { source?: string } }>;
   registerCommand(
     name: string,
     options: {

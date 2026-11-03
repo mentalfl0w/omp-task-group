@@ -32,7 +32,7 @@ import { Telemetry } from "./telemetry/metrics";
 import { injectPolicy } from "./dispatcher/policy";
 import { MissedGroupDetector } from "./dispatcher/missed-group";
 import { registerTaskGroupCommand } from "./commands";
-import { probeCapabilities, type CapabilityReport } from "./capabilities";
+import { TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY, probeCapabilities } from "./capabilities";
 import { isRecord } from "./guards";
 
 interface PendingEnvelope {
@@ -46,10 +46,38 @@ interface PendingEnvelope {
 }
 
 
-function nativeEvalCapabilities(config: TaskGroupConfig): BackendCapabilities {
+function nativeEvalCapabilities(config: TaskGroupConfig, pi: ExtensionAPI): BackendCapabilities {
+  let taskGroupPoolReason: string | undefined;
+  try {
+    const tools = pi.getAllTools?.();
+    if (tools === undefined) {
+      taskGroupPoolReason =
+        `public Eval ToolInfo inventory is unavailable; cannot verify ${TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY}, so using Fanout`;
+    } else {
+      const evalTools = tools.filter((tool) => tool.name === "eval");
+      const evalWrappers = evalTools.filter((tool) => tool.sourceInfo?.source !== "builtin");
+      if (evalTools.length === 0) {
+        taskGroupPoolReason =
+          `getAllTools() did not expose an Eval ToolInfo; cannot verify ${TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY}, so using Fanout`;
+      } else {
+        const unmarked = evalWrappers.filter(
+          (tool) => !tool.description?.split(/\s+/).includes(TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY),
+        );
+        if (unmarked.length > 0) {
+          taskGroupPoolReason =
+            `${unmarked.length} Eval wrapper(s) do not declare ${TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY}; Pool's proc cancellation policy is unknown, so using Fanout`;
+        }
+      }
+    }
+  } catch {
+    taskGroupPoolReason =
+      `could not inspect public Eval ToolInfo; cannot verify ${TASK_GROUP_POOL_PROC_CANCEL_CAPABILITY}, so using Fanout`;
+  }
   return {
     fanout: true,
     workpool: true,
+    taskGroupPool: taskGroupPoolReason === undefined,
+    ...(taskGroupPoolReason !== undefined ? { taskGroupPoolReason } : {}),
     summarize: config.summarize.enabled,
     structured: true,
     joinAll: true,
@@ -59,6 +87,8 @@ function nativeEvalCapabilities(config: TaskGroupConfig): BackendCapabilities {
     notes: [
       "compiled through the standard native eval tool",
       "final result is decoded from native details.cells[].views[].view.value",
+      "Pool preflight checks proc://, wait(), status(), peek(), and exact item coverage before returning one result",
+      ...(taskGroupPoolReason !== undefined ? [taskGroupPoolReason] : []),
       "no Task Group live marker stream",
     ],
   };
@@ -113,7 +143,6 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
   const telemetry = new Telemetry((customType, data) => pi.appendEntry(customType, data));
   const pendingCalls = new Map<string, PendingEnvelope>();
   let lastPlan: PlanResult | undefined;
-  let capabilityReport: CapabilityReport | undefined;
   const detector = new MissedGroupDetector(fallbackConfig, () => telemetry.recordMissedGroupCandidate());
 
   // ── Smart Dispatcher: policy injection (suggest default) ──────────
@@ -125,11 +154,10 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
   pi.on("tool_execution_start", (event) => detector.onToolExecutionStart(event.toolName, event.toolCallId, event.intent));
   pi.on("tool_execution_end", (event) => detector.onToolExecutionEnd(event.toolCallId));
 
-  // ── Telemetry rehydrate + capability probe per session ────────────
+  // ── Telemetry rehydrate per session ───────────────────────────────
   const onSessionOpen = (ctx: ExtensionContext): void => {
     pendingCalls.clear();
     telemetry.rehydrate(ctx.sessionManager.getBranch());
-    capabilityReport = probeCapabilities(ctx, fallbackConfig);
   };
   pi.on("session_start", (_event, ctx) => onSessionOpen(ctx));
   pi.on("session_switch", (_event, ctx) => onSessionOpen(ctx));
@@ -193,7 +221,7 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
     }
 
     const groupId = newGroupId();
-    const capabilities = nativeEvalCapabilities(config);
+    const capabilities = nativeEvalCapabilities(config, pi);
     const plan = planExecution(spec, capabilities, {
       enabled: config.execution.pool.enabled,
       threshold: config.execution.pool.threshold,
@@ -201,6 +229,7 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
     const compileOptions = {
       groupId,
       ...(config.summarize.enabled ? { summarize: { model: config.summarize.model } } : {}),
+      ...(plan.fallbackReason !== undefined ? { fallbackReason: plan.fallbackReason } : {}),
     };
     const code =
       plan.strategy === "pool"
@@ -254,7 +283,18 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
 
     const backgrounded = backgroundedReason(event.details);
     if (backgrounded !== undefined) return resultError(backgrounded);
-    if (event.isError) return undefined;
+    if (event.isError) {
+      const nativeError = event.content
+        .filter((item) => item.type === "text")
+        .map((item) => item.text)
+        .join("\n")
+        .trim();
+      return resultError(
+        nativeError.length > 0
+          ? `native eval failed: ${nativeError.slice(0, 800)}`
+          : "native eval failed before Task Group produced a result",
+      );
+    }
 
     try {
       const result = decodeEvalGroupResult(event.details, pending.spec, pending.groupId);
@@ -296,7 +336,13 @@ export default function taskGroupExtension(pi: ExtensionAPI): void {
     },
     getTelemetry: () => telemetry,
     getLastPlan: () => lastPlan,
-    getCapabilities: (ctx) => capabilityReport ?? probeCapabilities(ctx, fallbackConfig),
+    getCapabilities: (ctx) => {
+      try {
+        return probeCapabilities(ctx, loadConfig(ctx.cwd));
+      } catch {
+        return probeCapabilities(ctx, fallbackConfig);
+      }
+    },
   });
 }
 
