@@ -96,6 +96,12 @@ describe("payload selection", () => {
     const r = decodeResult(details([makePayload({ strategy: "pool" })]));
     expect(r.strategy).toBe("pool");
   });
+  test("preserves an optional runtime Pool fallback reason", () => {
+    const fallbackReason = "caller has another waitable job";
+    const result = decodeResult(details([makePayload({ strategy: "fanout", fallbackReason })]));
+    expect(result.strategy).toBe("fanout");
+    expect(result.fallbackReason).toBe(fallbackReason);
+  });
 
   test("ignores unrelated JSON views and selects the exact protocol and group id", () => {
     const valid = makePayload();

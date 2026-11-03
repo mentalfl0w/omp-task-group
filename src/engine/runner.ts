@@ -150,6 +150,19 @@ export async function runTaskGroup(args: {
     });
   }
 
+  const strategyChanged = result.strategy !== plan.strategy;
+  const fallbackReason = result.fallbackReason ?? plan.fallbackReason;
+  const actualPlan: PlanResult = {
+    ...plan,
+    strategy: result.strategy,
+    ...(fallbackReason !== undefined ? { fallbackReason } : {}),
+    ...(strategyChanged || (result.fallbackReason !== undefined && result.fallbackReason !== plan.fallbackReason)
+      ? { reasons: [...plan.reasons, "runtime fallback: " + (fallbackReason || "Fanout selected")] }
+      : {}),
+  };
+  reducer.current.strategy = actualPlan.strategy;
+  if (fallbackReason !== undefined) reducer.current.fallbackReason = fallbackReason;
+
   const groupState: TaskGroupSnapshot["state"] = result.cancelled
     ? "cancelled"
     : result.groupError !== undefined
@@ -170,7 +183,7 @@ export async function runTaskGroup(args: {
   telemetry.recordGroup({
     groupId,
     strategy: result.strategy,
-    fallbackReason: result.fallbackReason ?? plan.fallbackReason,
+    fallbackReason,
     join: spec.join,
     failure: spec.failure,
     taskCount: spec.tasks.length,
@@ -182,12 +195,12 @@ export async function runTaskGroup(args: {
     groupDurationMs: durationMs,
     estimatedWakesAvoided,
     barrierViolated: result.barrierViolated,
-    planReasons: plan.reasons,
+    planReasons: actualPlan.reasons,
   });
 
   const summaryLine =
     groupState === "completed"
-      ? `Task Group ✓ · ${snapshot.counts.succeeded}/${snapshot.counts.total} succeeded · ${plan.strategy}`
+      ? `Task Group ✓ · ${snapshot.counts.succeeded}/${snapshot.counts.total} succeeded · ${actualPlan.strategy}`
       : groupState === "cancelled"
         ? "Task Group cancelled"
         : `Task Group failed · ${snapshot.counts.succeeded}/${snapshot.counts.total} succeeded`;
@@ -204,5 +217,5 @@ export async function runTaskGroup(args: {
   if (result.barrierViolated !== undefined) {
     delivered += `\n\nwarning: ${result.barrierViolated}`;
   }
-  return { text: delivered, details, isError, snapshot, plan, gateMode: gate.mode };
+  return { text: delivered, details, isError, snapshot, plan: actualPlan, gateMode: gate.mode };
 }

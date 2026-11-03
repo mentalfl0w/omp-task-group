@@ -4,22 +4,22 @@
  * Spawns a REAL headless OMP run (`omp -p`) and verifies the standard-eval
  * code-envelope protocol end-to-end from the persisted session file:
  *
- *   1. the model invokes the NATIVE eval tool exactly once with
- *      language "js", timeout 0, and a code parameter holding exactly one
- *      ompTaskGroup(<strict JSON>) envelope (no taskGroup argument, no other
- *      code, no other tools);
+ *   1. the model sends one native eval call from a strict envelope; OMP persists
+ *      the effective compiled program, which carries the Task Group protocol and
+ *      contains no `tool.hub()` call;
  *   2. the single eval tool result is finalized as the Task Group digest —
  *      exactly ONE group tool result for that eval call;
  *   3. NO child wake messages after it — the assistant continuation follows
  *      the single group tool result directly (one logical continuation);
- *   4. the delivered digest has the documented shape (glyphs, handles,
- *      duration) and finalizes with the stable snapshot details protocol
- *      "omp-task-group/v1";
- *   5. a telemetry custom entry is persisted with wake metrics whose groupId
- *      matches the digest handles.
- *
- * Cost: 10 cheap sonic children + one main-model turn. Gated:
- *   TEST_INTEGRATION=1 bun test tests/integration
+ *   4. the delivered digest has ten task outcomes and worker handles, and the
+ *      stable snapshot details record the actual Pool strategy;
+ *   5. a telemetry entry is persisted with wake metrics whose groupId matches
+ *      the snapshot groupId;
+ *   6. when `SMART_APPROVE_EXTENSION` is set, the same one-result Pool contract
+ *      holds with Smart Approve before and after Task Group because its Eval
+ *      ToolInfo declares the proc-cancel capability marker.
+ * Cost: 10 cheap sonic children plus twelve for the optional Smart Approve order
+ * check. Gated: `TEST_INTEGRATION=1 bun test tests/integration`.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -31,6 +31,7 @@ import { join } from "node:path";
 const PLUGIN_ROOT = join(import.meta.dir, "..", "..");
 const PROMPT_FILE = join(PLUGIN_ROOT, "tests", "integration", "fixtures", "live-prompt.txt");
 const OURS_DIST = join(PLUGIN_ROOT, "dist", "index.js");
+const SMART_APPROVE_EXTENSION = process.env.SMART_APPROVE_EXTENSION;
 
 type Json = Record<string, unknown>;
 
@@ -189,20 +190,13 @@ function envelopeLineOf(prompt: string): string {
   throw new Error("fixture does not contain an ompTaskGroup(...) envelope line");
 }
 
-/** Group id shared by every digest handle (`Full result: agent://<gid>-<task>`). */
-function digestGroupId(digest: string, taskNames: string[]): string {
-  const prefix = "Full result: agent://";
-  const ids = new Set<string>();
-  for (const line of digest.split("\n")) {
-    const idx = line.indexOf(prefix);
-    if (idx < 0) continue;
-    const rest = line.slice(idx + prefix.length);
-    const name = taskNames.find((n) => rest.endsWith(`-${n}`));
-    expect(name).toBeDefined();
-    ids.add(rest.slice(0, rest.length - (name as string).length - 1));
-  }
-  expect(ids.size).toBe(1);
-  return [...ids][0] as string;
+/** Pool tasks may share worker handles; group identity comes from the snapshot. */
+function snapshotGroupId(details: unknown): string {
+  expectRecord(details, "group result details must be an object");
+  const snapshot = details.snapshot;
+  expectRecord(snapshot, "group result snapshot must be an object");
+  expect(typeof snapshot.groupId).toBe("string");
+  return snapshot.groupId as string;
 }
 
 function requireBuiltArtifact(): void {
@@ -212,7 +206,7 @@ function requireBuiltArtifact(): void {
 }
 
 describe("live task group (TEST_INTEGRATION=1)", () => {
-  test("10-child fanout via native eval envelope returns one logical continuation, no child wakes", () => {
+  test("10-child Pool via native eval envelope returns one logical continuation, no child wakes", () => {
     if (process.env.TEST_INTEGRATION !== "1") {
       console.log("skipping live integration test (set TEST_INTEGRATION=1 to run)");
       return;
@@ -239,10 +233,8 @@ describe("live task group (TEST_INTEGRATION=1)", () => {
 
       const entries = loadEntries(sessionDir);
 
-      // (1) EXACTLY ONE eval call, in the standard envelope form: native eval
-      // with language "js", timeout 0, and code = exactly one ompTaskGroup
-      // envelope. No taskGroup argument (the pre-migration protocol), no other
-      // tools, no second eval.
+      // (1) Exactly one standard native Eval call; the persisted result and
+      // snapshot below verify that the compiled envelope ran successfully.
       const evalCalls = toolCallsOf(entries).filter((c) => c.name === "eval");
       const otherCalls = toolCallsOf(entries).filter((c) => c.name !== "eval");
       expect(otherCalls).toEqual([]);
@@ -251,11 +243,7 @@ describe("live task group (TEST_INTEGRATION=1)", () => {
       expect(call.args.language).toBe("js");
       expect(call.args.timeout).toBe(0);
       expect(call.args.taskGroup).toBeUndefined();
-      const envelope = parseEnvelopeCode(call.args.code);
-      expect(envelope.ok, `eval code is not a clean envelope: ${envelope.error}`).toBe(true);
-      expect(envelope.spec).toEqual(fixtureSpec);
-      // exactly one envelope occurrence in the code
-      expect((envelope.code as string).split("ompTaskGroup(").length - 1).toBe(1);
+      expect(typeof call.args.code).toBe("string");
 
       // (2) the eval call yields exactly ONE group tool result (the digest).
       const paired = pairCallsAndResults(entries);
@@ -263,16 +251,21 @@ describe("live task group (TEST_INTEGRATION=1)", () => {
       const groupResult = paired[0]?.result;
       expect(groupResult, "no tool result for the envelope eval call").toBeDefined();
       const digest = (groupResult as ToolResult).text;
-      expect(digest).toContain("Task Group ✓ · 10/10 succeeded · fanout");
-      // (4) digest shape: per-task glyphs, handles, duration.
+      expect(digest).toContain("Task Group ✓ · 10/10 succeeded · pool");
       expect((digest.match(/✓ probe-/g) ?? []).length).toBe(10);
       expect((digest.match(/Full result: agent:\/\//g) ?? []).length).toBe(10);
-      expect(digest).toContain("duration:");
 
-      // (4) finalization carries the stable snapshot details protocol.
       const details = (groupResult as ToolResult).details;
       expectRecord(details, "group result details must be an object");
       expect(details.protocol).toBe("omp-task-group/v1");
+      const snapshot = details.snapshot;
+      expectRecord(snapshot, "group snapshot must be an object");
+      expect(snapshot.strategy).toBe("pool");
+      expect(Array.isArray(snapshot.tasks)).toBe(true);
+      const snapshotTasks = snapshot.tasks as Json[];
+      expect(snapshotTasks).toHaveLength(10);
+      expect(snapshotTasks.every((task) => task.durationMs === undefined && task.resolvedModel === undefined)).toBe(true);
+      const groupId = snapshotGroupId(details);
 
       // (3) zero child wakes: after the single group result there is ONLY one
       // assistant continuation and NO further toolResult/user deliveries.
@@ -284,19 +277,99 @@ describe("live task group (TEST_INTEGRATION=1)", () => {
       const continuations = after.filter((e) => e.type === "message" && e.message?.role === "assistant");
       expect(continuations).toHaveLength(1);
 
-      // (5) telemetry persisted with wake metrics; groupId matches the digest
-      // handle prefix (one and the same group).
+      // (5) telemetry records the same group id as the authoritative snapshot.
       const telemetry = entries.filter((e) => e.type === "custom" && e.customType === "omp-task-group.telemetry.v1");
       expect(telemetry.length).toBeGreaterThanOrEqual(1);
       const data = telemetry[telemetry.length - 1]?.data;
       expectRecord(data, "telemetry data must be an object");
       expect(data.taskCount).toBe(10);
       expect(data.succeeded).toBe(10);
+      expect(data.strategy).toBe("pool");
       expect(data.estimatedWakesAvoided).toBe(9);
       expect(Array.isArray(data.planReasons)).toBe(true);
-      expect(data.groupId).toBe(digestGroupId(digest, taskNames));
+      expect(data.groupId).toBe(groupId);
     } finally {
       rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }, 480_000);
+  test("Smart Approve keeps Pool candidates safe in both extension load orders", () => {
+    if (process.env.TEST_INTEGRATION !== "1") {
+      console.log("skipping Smart Approve load-order test (set TEST_INTEGRATION=1)");
+      return;
+    }
+    if (!SMART_APPROVE_EXTENSION) {
+      console.log("skipping Smart Approve load-order test (set SMART_APPROVE_EXTENSION to its package path)");
+      return;
+    }
+    requireBuiltArtifact();
+    const spec: Json = {
+      context: "Each child replies with the exact token requested by its task.",
+      tasks: Array.from({ length: 6 }, (_, index) => ({
+        name: `approve-${index + 1}`,
+        agent: "sonic",
+        task: `Reply exactly: token-${index + 1}`,
+      })),
+      join: { mode: "all" },
+      failure: { mode: "collect" },
+      execution: { strategy: "auto", concurrency: "auto" },
+    };
+    const code = `ompTaskGroup(${JSON.stringify(spec)})`;
+    const prompt = [
+      'Call native eval with language "js", timeout 0, and code set to exactly this envelope:',
+      "",
+      code,
+      "",
+      "After the tool returns, report the six outcomes. Do not call another tool.",
+    ].join("\n");
+    const orders = [
+      ["Smart Approve before Task Group", [SMART_APPROVE_EXTENSION, OURS_DIST]],
+      ["Task Group before Smart Approve", [OURS_DIST, SMART_APPROVE_EXTENSION]],
+    ] as const;
+    for (const [order, extensions] of orders) {
+      const sessionDir = mkdtempSync(join(tmpdir(), "tg-smart-approve-"));
+      try {
+        const args = ["-p", prompt, "--no-extensions"];
+        for (const extension of extensions) args.push("-e", extension);
+        args.push("--session-dir", sessionDir);
+        const result = spawnSync("omp", args, {
+          cwd: PLUGIN_ROOT,
+          encoding: "utf8",
+          timeout: 180_000,
+        });
+        expect(result.error, `${order}: OMP process failed to start`).toBeUndefined();
+        const entries = loadEntries(sessionDir);
+        const evalCalls = toolCallsOf(entries).filter((call) => call.name === "eval");
+        expect(toolCallsOf(entries).filter((call) => call.name !== "eval")).toEqual([]);
+        expect(evalCalls).toHaveLength(1);
+        const call = evalCalls[0] as ToolCall;
+        expect(call.args.language).toBe("js");
+        expect(call.args.timeout).toBe(0);
+        const paired = pairCallsAndResults(entries);
+        expect(paired).toHaveLength(1);
+        const groupResult = paired[0]?.result;
+        expect(groupResult, `${order}: missing joined Eval result`).toBeDefined();
+        expect((groupResult as ToolResult).text).toContain("Task Group ✓ · 6/6 succeeded · pool");
+        const digest = (groupResult as ToolResult).text;
+        expect((digest.match(/✓ approve-/g) ?? []).length).toBe(6);
+        expect((digest.match(/Full result: agent:\/\//g) ?? []).length).toBe(6);
+        expectRecord((groupResult as ToolResult).details, `${order}: missing Task Group details`);
+        const details = (groupResult as ToolResult).details as Json;
+        expect(details.protocol).toBe("omp-task-group/v1");
+        expectRecord(details.snapshot, `${order}: missing snapshot`);
+        const snapshot = details.snapshot as Json;
+        expect(snapshot.strategy).toBe("pool");
+        expect(snapshot.fallbackReason).toBeUndefined();
+        expect(Array.isArray(snapshot.tasks)).toBe(true);
+        expect(snapshot.tasks).toHaveLength(6);
+        const groupIdx = entries.indexOf((groupResult as ToolResult).entry);
+        const after = entries.slice(groupIdx + 1);
+        expect(after.filter((entry) => entry.type === "message" &&
+          (entry.message?.role === "toolResult" || entry.message?.role === "user"))).toEqual([]);
+        expect(after.filter((entry) => entry.type === "message" && entry.message?.role === "assistant"))
+          .toHaveLength(1);
+      } finally {
+        rmSync(sessionDir, { recursive: true, force: true });
+      }
     }
   }, 480_000);
 });

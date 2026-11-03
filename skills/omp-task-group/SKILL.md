@@ -50,5 +50,13 @@ Keep each task self-contained and give it a unique name. Put shared context in `
 - Prefer `failure.mode: "collect"` to retain partial results. Use `"fail_fast"` only when one failure makes the remaining work unnecessary.
 - Keep the default `output.mode: "compact"` unless the consumer needs schema-validated structured output. Add a task `schema` when requesting structured output. `summarize` requires the plugin's summarize option to be enabled.
 - Leave strategy and concurrency on `"auto"` unless the request has a concrete reason to constrain them.
+- `auto` may select Pool only for homogeneous `all + collect` batches with no
+  task schema, isolation, or explicit per-group concurrency. Runtime preflight
+  falls back to Fanout before item submission if caller-owned jobs could make
+  `tool.wait()` consume an unrelated result.
+- A non-builtin Eval wrapper permits Pool only when its public `ToolInfo.description` contains `omp-task-group-pool-proc-cancel:v1`. If any wrapper lacks the marker or ToolInfo cannot be inspected, Task Group falls back to Fanout before dispatch and records the reason.
+- Pool results are recovered by Workpool item IDs from `pool.peek()` batch JSON;
+  missing, duplicated, malformed, truncated, or duplicate-key results fail closed.
+  A post-dispatch recovery failure never reruns tasks through Fanout.
 
 The group requires a foreground native eval call. If the plugin blocks it because eval auto-background is enabled, report that requirement; do not work around it by running the group in the background or changing the user's settings.

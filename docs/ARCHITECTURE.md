@@ -25,8 +25,8 @@
 │   → stable snapshot details (omp-task-group/v1)            │
 ├────────────────────────────────────────────────────────────┤
 │ KERNEL (inside the native eval cell, compiled program)     │
-│   ONLY public prelude: agent / wait / workpool /           │
-│   completion / console.log / phase / tool.hub              │
+│   Eval: agent / wait / completion / workpool / console.log  │
+│   tool bridge: read / wait / write via public APIs           │
 └────────────────────────────────────────────────────────────┘
 │ RESULT GATE (src/result)   bound the delivered bytes       │
 │ PRESENTATION (src/presentation)  digest text from snapshot │
@@ -61,7 +61,7 @@ exactly the envelope). Two hooks turn that call into a group:
    snapshot details — `{ protocol: "omp-task-group/v1", snapshot, gate, ... }`.
    The hook then replaces the native result with the bounded digest and snapshot.
 
-OMP v18.12 retains at most 16 JSON views per cell and drops a view over 32 KiB.
+OMP v18.16 retains at most 16 JSON views per cell and drops a view over 32 KiB.
 The compiler emits 14,000-character chunks; results requiring more than 16
 chunks produce a fail-closed size error instead of a partial result.
 
@@ -70,16 +70,23 @@ There is no custom live-update stream, RPC snapshot channel, or widget. The
 transport; they do not carry live per-task progress.
 
 
-## Why the parent sees exactly one delivery
+## Why the parent sees one result
 
-1. The whole fan-out/join executes **inside one native eval cell**: children are
-   `agent()`-spawned with unique labels (`<groupId>-<task>`), and each handle gets
-   exactly one wait, consumed exactly once when it settles — so child async-job
-   deliveries are consumed in-cell and never re-deliver to the parent.
-2. Early-exit joins (`any`, `quorum`, `fail_fast`) cancel pending children and
-   reap their waits (3s gate), so cancelled children never re-deliver either.
-3. One native eval result, finalized by the `tool_result` hook, is the only
-   continuation the parent receives.
+1. Fanout runs inside one native Eval cell. One terminal result is consumed
+   per handle; if a wait fails while a child is live, the handle is canceled
+   and reaped with bounded retries. Early-exit joins also reap pending handles,
+   and queued tasks receive a cancelled outcome.
+2. Pool runs only for eligible `all + collect` batches. Before dispatch, the
+   program checks `proc://` for competing waitable jobs/live agents and probes
+   empty `wait()` only when no owned service would block it. Once the Pool job
+   exists, service completion events return its job snapshot; the loop continues
+   until it consumes the Workpool aggregate result through `tool.wait()`.
+3. Pool outcomes map each `pool.push()` item id to exactly one `peek().batches[]`
+   entry and one validated JSON result envelope. A failed preflight falls back to
+   Fanout before `push()`; any uncertain post-dispatch result is canceled, reaped,
+   and returned as failure without rerunning the tasks.
+4. One foreground native Eval result, finalized by `tool_result`, is the normal
+   Task Group continuation.
 
 ## Envelope grammar
 
@@ -92,17 +99,23 @@ transport; they do not carry live per-task progress.
 ## Compiler invariants
 
 - Spec embeds as JSON inside the rewritten cell — no escaping holes.
-- The compiled program uses only OMP's public eval prelude and sends the
-  `omp-task-group/eval-result-v1` payload through JSON-view chunks.
-- Each chunk is 14,000 characters or less; at most 16 chunks fit one eval cell.
+- The compiled program uses OMP's public Eval prelude and ordinary
+  `tool.read` / `tool.wait` / `tool.write` calls; no private imports.
+- The `omp-task-group/eval-result-v1` payload travels through bounded JSON-view
+  chunks: 14,000 characters per chunk, at most 16 chunks per cell.
 - Per-task output is clipped before transport. No `import` / `require` /
   `process` appears in the generated program.
 - Join semantics:
-  - `all + collect` → race until every child settles, no early exit
+  - `all + collect` → wait until every child settles
   - `all + fail_fast` → first failure cancels the rest
-  - `any` / `quorum` → condition satisfied cancels the rest
-- Pool only for `all + collect` homogeneous batches.
-- `Promise.withResolvers()` for the reap gate (3s), `setTimeout` contained.
+  - `any` / `quorum` → a satisfied condition cancels the rest
+- Pool is limited to homogeneous `all + collect`, with no per-task schema,
+  isolation, or explicit concurrency override.
+- Pool results are decoded from per-batch JSON keyed by returned Workpool item
+  IDs. Exact identity coverage, unique assignment, batch terminal state, and
+  aggregate item counts must agree before success is accepted.
+- Pool completion uses the ordinary `wait` tool, not Eval `wait(handles)` and
+  not a polling loop. The preflight avoids consuming other caller-owned results.
 
 ## Finalizer invariants (eval-result)
 
@@ -128,8 +141,8 @@ Task Group requires a foreground native eval cell.
 
 ## Public API discipline
 
-`src/types.ts` reproduces documented contracts only (docs/extensions.md,
-docs/tools/eval.md, docs/tools/hub.md, docs/tui.md). The check is enforced twice:
-`scripts/check-private-imports.ts` (CI) and `tests/unit/private-api.test.ts`.
+`src/types.ts` reproduces documented contracts only (`docs/extensions.md`,
+`docs/tools/eval.md`, `docs/tools/wait.md`, and `docs/tools/read.md` for `proc://`).
+The check is enforced by `scripts/check-private-imports.ts` (CI) and `tests/unit/private-api.test.ts`.
 No `@oh-my-pi/*` runtime imports anywhere — the host's bundled copy is never
 reached through module graphs.

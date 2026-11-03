@@ -85,7 +85,10 @@ export function registerTaskGroupCommand(pi: ExtensionAPI, deps: CommandDeps): v
         text = `Task Group configuration\n\n${JSON.stringify(config, null, 2)}`;
       } else {
         const caps = deps.getCapabilities(ctx);
-        const capLines = caps.rows.map((r) => `${r.ok ? "✓" : "✗"} ${r.name}${r.note ? `  — ${r.note}` : ""}`);
+        const capLines = caps.rows.map((r) => {
+          const marker = r.availability === "conditional" ? "~" : r.ok ? "✓" : "✗";
+          return `${marker} ${r.name}${r.note ? `  — ${r.note}` : ""}`;
+        });
         text = [
           "omp-task-group — atomic multi-agent coordination",
           "",
