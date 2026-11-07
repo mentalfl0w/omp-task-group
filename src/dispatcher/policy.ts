@@ -21,6 +21,14 @@ Use the standard \`eval\` tool (language "js", timeout 0) with an
 - the next meaningful parent decision depends on their COMBINED results;
 - no dependency exists between them (one batch, one joined result back).
 
+For an explicitly backgrounded Task Group, save its groupId and resultId.
+When OMP delivers that pool's async-result, treat it as an ungated preview,
+not the final result. Without asking the user for commands, in the same JS
+kernel call eval with exactly \`ompTaskGroupCollect({"groupId":"…","resultId":"…"})\`,
+without reset. When ready, read all segments with \`task_group_result\`, then
+confirm consume.
+If collect fails, report the error; never rerun dispatched tasks.
+
 Use \`swarm\` when later jobs depend on earlier outputs, or when DAG,
 pipeline, loop, persistence or resume is required — Task Group is a single
 atomic fan-out/join batch, NOT a workflow engine.`;

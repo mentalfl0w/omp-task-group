@@ -176,7 +176,16 @@ export async function runTaskGroup(args: {
   snapshot.metrics.rawChildChars = result.rawChildChars;
   snapshot.metrics.estimatedWakesAvoided = estimatedWakesAvoided;
 
-  const gate = runResultGate(result.outcomes, spec, { groupState, groupError: result.groupError, summary: result.summary });
+  const gate =
+    result.gateText !== undefined && result.gateMode !== undefined
+      ? {
+          deliveredText: result.gateText,
+          deliveredChars: result.gateText.length,
+          mode: result.gateMode,
+          ...(result.gateError !== undefined ? { error: result.gateError } : {}),
+        }
+      : runResultGate(result.outcomes, spec, { groupState, groupError: result.groupError, summary: result.summary });
+  const gateError = gate.error;
   snapshot.metrics.deliveredChars = gate.deliveredChars;
   if (result.barrierViolated !== undefined) snapshot.fallbackReason = result.barrierViolated;
 
@@ -204,17 +213,22 @@ export async function runTaskGroup(args: {
       : groupState === "cancelled"
         ? "Task Group cancelled"
         : `Task Group failed · ${snapshot.counts.succeeded}/${snapshot.counts.total} succeeded`;
-  let delivered = `${summaryLine}\n\n${gate.deliveredText}`;
+  // A gate failure means the delivered text cannot represent the group; never
+  // prefix it with a success summary line.
+  let delivered = gateError !== undefined ? gate.deliveredText : `${summaryLine}\n\n${gate.deliveredText}`;
 
-  const isError = groupState === "failed" || groupState === "cancelled";
+  const isError = groupState === "failed" || groupState === "cancelled" || gateError !== undefined;
   const details: Record<string, unknown> = {
     protocol: snapshot.protocol,
     snapshot,
     gate: gate.mode,
     ...(result.groupError !== undefined ? { error: result.groupError } : {}),
+    ...(gateError !== undefined ? { gateError } : {}),
     ...(result.barrierViolated !== undefined ? { barrierViolation: result.barrierViolated } : {}),
   };
-  if (result.barrierViolated !== undefined) {
+  // Keep the hard maxTotalChars cap intact when the gate already failed; the
+  // barrier violation remains in details.
+  if (result.barrierViolated !== undefined && gateError === undefined) {
     delivered += `\n\nwarning: ${result.barrierViolated}`;
   }
   return { text: delivered, details, isError, snapshot, plan: actualPlan, gateMode: gate.mode };

@@ -5,16 +5,18 @@
  *   /task-group stats      cumulative telemetry for this session
  *   /task-group explain    why the last group chose its strategy
  *   /task-group config     effective configuration
+ *   /task-group background  two-phase Workpool background + foreground scan
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "./types";
 import type { TaskGroupConfig } from "./config";
-import { probeCapabilities, type CapabilityReport } from "./capabilities";
+import { type CapabilityReport } from "./capabilities";
+import { formatBarrierDiagnosis, scanAutoBackgroundConfig } from "./barriers";
 import type { Telemetry } from "./telemetry/metrics";
 import type { PlanResult } from "./engine/planner";
 
 export interface CommandDeps {
-  getConfig: () => TaskGroupConfig;
+  getConfig: (ctx: ExtensionCommandContext) => TaskGroupConfig;
   getTelemetry: () => Telemetry;
   getLastPlan: () => PlanResult | undefined;
   getCapabilities: (ctx: ExtensionCommandContext) => CapabilityReport;
@@ -47,6 +49,7 @@ function renderStats(t: Telemetry): string {
     `Raw child output           ${fmtChars(a.rawChildChars)} chars`,
     `Delivered to parent        ${fmtChars(a.deliveredChars)} chars`,
     `Output reduction           ${(t.outputReduction * 100).toFixed(1)}%`,
+    "Background native notices and collect/read/consume calls are excluded from these estimates.",
     "",
     `Fanout                     ${fmtInt(a.fanoutSelections)}`,
     `Workpool                   ${fmtInt(a.poolSelections)}`,
@@ -72,17 +75,43 @@ function renderExplain(plan: PlanResult | undefined): string {
 
 export function registerTaskGroupCommand(pi: ExtensionAPI, deps: CommandDeps): void {
   pi.registerCommand("task-group", {
-    description: "Task Group: stats / explain / config",
+    description: "Task Group: stats / explain / config / background",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/)[0] ?? "";
-      const config = deps.getConfig();
+      const config = deps.getConfig(ctx);
       let text: string;
       if (sub === "stats") {
         text = renderStats(deps.getTelemetry());
       } else if (sub === "explain") {
         text = renderExplain(deps.getLastPlan());
       } else if (sub === "config") {
-        text = `Task Group configuration\n\n${JSON.stringify(config, null, 2)}`;
+        const retention = config.background.retentionMinutes;
+        text = [
+          "Task Group configuration",
+          "",
+          JSON.stringify(config, null, 2),
+          "",
+          "Background execution: explicit two-phase Workpool opt-in (background=\"require\" or execution.mode=\"background\"). Admission requires homogeneous join=all + failure=collect tasks and a Workpool plan. The dispatch cell returns after verified push ids; an explicit ompTaskGroupCollect cell follows OMP's native async-result notice; the gated result is read with task_group_result. It does not depend on eval.autoBackground.",
+          `Result retention: background.retentionMinutes=${retention} (observed-result window; range 1-1440, default 30). The pending deadline stays at two hours and this key never enables background execution.`,
+        ].join("\n");
+      } else if (sub === "background") {
+        const retention = config.background.retentionMinutes;
+        text = [
+          "Task Group background (two-phase native Workpool):",
+          "- opt in with background=\"require\" or execution.mode=\"background\".",
+          "- admission: homogeneous join=all + failure=collect, no per-task schema/isolation, execution.concurrency=auto, output.mode compact|structured, pool enabled; the numeric pool threshold is not applied.",
+          "- dispatch: creates workpool(name=groupId), pushes every task, retains {pool, itemIds} in the eval kernel, and returns the verified ids. No wait(), no background promise, no plugin notification.",
+          "- completion signal: OMP's own async-result notice. Its preview can contain ungated aggregate child text and is not the Task Group result.",
+          "- collect: ompTaskGroupCollect({\"groupId\":…,\"resultId\":…}) reads only status()/peek(). It reports pending while the pool drains, never waits, never consumes another job, and fails closed on an incompatible or missing kernel handle.",
+          "- result: one atomic 0600 file in a 0700 private directory, SHA-256 verified, read and consumed with task_group_result.",
+          "- cancel: write proc://<groupId>/kill, then collect. No result is fabricated if the pool service is already gone; OMP may send no async-result after cancellation.",
+          "",
+          "Foreground compatibility (eval.autoBackground scan):",
+          formatBarrierDiagnosis(scanAutoBackgroundConfig(ctx.cwd, { mode: ctx.mode })),
+          "",
+          `Task Group result retention for this cwd: ${retention} minute(s) (background.retentionMinutes; range 1-1440, default 30).`,
+          "It bounds only an observed, unconsumed result file and never modifies the upstream eval.autoBackground settings. The pending deadline remains two hours.",
+        ].join("\n");
       } else {
         const caps = deps.getCapabilities(ctx);
         const capLines = caps.rows.map((r) => {
@@ -99,7 +128,7 @@ export function registerTaskGroupCommand(pi: ExtensionAPI, deps: CommandDeps): v
           "Capabilities:",
           ...capLines,
           "",
-          "Subcommands: stats · explain · config",
+          "Subcommands: stats · explain · config · background",
         ].join("\n");
       }
       ctx.ui.notify(text, "info");

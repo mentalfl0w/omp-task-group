@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { validateSpec, SpecValidationError } from "../../src/schema/task-group";
+import { isBackgroundRequested, validateSpec, SpecValidationError } from "../../src/schema/task-group";
 
 const BASE = {
   context: "Shared research context.",
@@ -16,11 +16,43 @@ describe("validateSpec", () => {
     expect(spec.failure.mode).toBe("collect");
     expect(spec.execution.strategy).toBe("auto");
     expect(spec.execution.concurrency).toBe("auto");
+    expect(spec.execution.mode).toBe("auto");
+    expect(spec.background).toBe("auto");
     expect(spec.output.mode).toBe("compact");
     expect(spec.output.perTaskChars).toBe(1200);
     expect(spec.output.maxTotalChars).toBe(8000);
     expect(spec.output.preserveHandles).toBe(true);
     expect(spec.tasks[1]?.agent).toBe("scout");
+  });
+
+  test("accepts explicit background opt-in and keeps auto/foreground foreground", () => {
+    expect(validateSpec({ ...BASE, background: "foreground" }).background).toBe("foreground");
+    expect(validateSpec({ ...BASE, background: "auto" }).background).toBe("auto");
+    const require = validateSpec({ ...BASE, background: "require" });
+    expect(require.background).toBe("require");
+    expect(isBackgroundRequested(require)).toBe(true);
+    expect(isBackgroundRequested(validateSpec(BASE))).toBe(false);
+    expect(isBackgroundRequested(validateSpec({ ...BASE, background: "foreground" }))).toBe(false);
+    expect(() => validateSpec({ ...BASE, background: "always" })).toThrow(/must be "auto" \| "foreground" \| "require"/);
+    expect(() => validateSpec({ ...BASE, background: true })).toThrow(/must be "auto"/);
+  });
+
+  test("accepts execution.mode=background and rejects contradictory explicit policies", () => {
+    const spec = validateSpec({ ...BASE, execution: { mode: "background" } });
+    expect(spec.execution.mode).toBe("background");
+    expect(isBackgroundRequested(spec)).toBe(true);
+    expect(validateSpec({ ...BASE, execution: { mode: "auto" } }).execution.mode).toBe("auto");
+    expect(validateSpec({ ...BASE, execution: { mode: "foreground" } }).execution.mode).toBe("foreground");
+    expect(() =>
+      validateSpec({ ...BASE, background: "require", execution: { mode: "foreground" } }),
+    ).toThrow(/background="require" conflicts with execution.mode="foreground"/);
+    expect(() =>
+      validateSpec({ ...BASE, background: "foreground", execution: { mode: "background" } }),
+    ).toThrow(/background="foreground" conflicts with execution.mode="background"/);
+    expect(() => validateSpec({ ...BASE, execution: { mode: "always" } })).toThrow(
+      /must be "auto" \| "foreground" \| "background"/,
+    );
+    expect(() => validateSpec({ ...BASE, execution: { mode: true } })).toThrow(/must be "auto"/);
   });
 
   test("rejects fewer than 2 tasks", () => {

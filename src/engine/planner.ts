@@ -7,7 +7,7 @@
  */
 
 import type { BackendCapabilities } from "../backend/interface";
-import type { TaskGroupSpec } from "../schema/task-group";
+import { isBackgroundRequested, type TaskGroupSpec } from "../schema/task-group";
 
 export type StrategyDecision = "fanout" | "pool";
 
@@ -66,13 +66,15 @@ function poolUnavailableReason(
 export function planExecution(
   spec: TaskGroupSpec,
   capabilities: BackendCapabilities,
-  poolConfig: { enabled: "auto" | "off"; threshold: number },
+  poolConfig: { enabled: "auto" | "off"; threshold: number; background?: boolean },
 ): PlanResult {
   const reasons: string[] = [];
   const homogeneous = isHomogeneous(spec);
   const joinAllCollect = spec.join.mode === "all" && spec.failure.mode === "collect";
   const featureReason = poolFeatureReason(spec);
-  const countOk = spec.tasks.length >= poolConfig.threshold;
+  // Background is only deliverable through a real Workpool; it forces pool
+  // eligibility instead of being blocked by the auto-selection threshold.
+  const countOk = poolConfig.background === true || spec.tasks.length >= poolConfig.threshold;
   const poolCandidate = joinAllCollect && homogeneous && countOk;
   const poolEligible =
     capabilities.workpool &&
@@ -83,6 +85,12 @@ export function planExecution(
 
   reasons.push("tasks: " + spec.tasks.length);
   reasons.push("agents: " + spec.tasks.map((t) => t.agent).join(", "));
+  reasons.push(
+    "background: " +
+      (isBackgroundRequested(spec)
+        ? "explicit Workpool async dispatch + explicit collect + task_group_result; the pool threshold is not applied"
+        : spec.background + " (foreground)"),
+  );
   reasons.push("join: " + spec.join.mode + (spec.join.mode === "quorum" ? " (" + spec.join.quorum + ")" : ""));
   reasons.push("failure: " + spec.failure.mode);
   reasons.push("homogeneous: " + (homogeneous ? "yes" : "no"));
@@ -111,6 +119,7 @@ export function planExecution(
     }
   } else if (poolConfig.enabled === "off") {
     strategy = "fanout";
+    if (poolConfig.background === true) fallbackReason = "Pool disabled by config";
     reasons.push("strategy: fanout (pool disabled by config)");
   } else if (poolEligible) {
     strategy = "pool";
