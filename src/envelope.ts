@@ -33,6 +33,10 @@
  */
 
 export const ENVELOPE_NAME = "ompTaskGroup";
+/** Explicit collect envelope for a two-phase Workpool background group. */
+export const COLLECT_ENVELOPE_NAME = "ompTaskGroupCollect";
+const GROUP_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const RESULT_ID_PATTERN = /^tgbg_[a-f0-9]{16}$/;
 
 /** Stable machine-readable reason for a recognized-but-invalid envelope. */
 export type EnvelopeErrorCode =
@@ -70,7 +74,11 @@ export type EnvelopeParseResult =
 
 const IDENT_CONTINUATION = /[A-Za-z0-9_$]/;
 
-function malformed(code: EnvelopeErrorCode, message: string, detail?: string): EnvelopeParseResult {
+function malformed(
+  code: EnvelopeErrorCode,
+  message: string,
+  detail?: string,
+): { kind: "malformed"; error: EnvelopeParseError } {
   return { kind: "malformed", error: detail === undefined ? { code, message } : { code, message, detail } };
 }
 
@@ -149,63 +157,63 @@ function clip(text: string, n: number): string {
   return text.length <= n ? text : `${text.slice(0, n)}…`;
 }
 
+type RawEnvelopeParseResult =
+  | { readonly kind: "non-envelope" }
+  | { readonly kind: "malformed"; readonly error: EnvelopeParseError }
+  | { readonly kind: "valid"; readonly value: unknown; readonly rawJson: string };
+
 /**
- * Parse eval `code` against the Task Group envelope grammar.
- *
- * Total function: never throws, never evaluates JavaScript. Distinguishes
- * ordinary eval code (`non-envelope`) from recognized-but-invalid envelopes
- * (`malformed`, with code + message) from valid envelopes (`valid`, carrying
- * the raw parsed JSON argument). A valid result is NOT schema-validated here —
- * run `validateSpec` on `spec` downstream before compiling.
+ * Grammar-only parse for one reserved envelope name. Shared by the group
+ * envelope and the collect envelope so both have identical strictness.
  */
-export function parseTaskGroupEnvelope(code: unknown): EnvelopeParseResult {
+function parseNamedEnvelope(code: unknown, name: string): RawEnvelopeParseResult {
   if (typeof code !== "string") return { kind: "non-envelope" };
 
   const src = code.trimStart();
-  if (!src.startsWith(ENVELOPE_NAME)) return { kind: "non-envelope" };
+  if (!src.startsWith(name)) return { kind: "non-envelope" };
 
-  const afterName = src[ENVELOPE_NAME.length];
-  // A different, longer identifier (ompTaskGroupX) is not our reserved entry.
+  const afterName = src[name.length];
+  // A different, longer identifier (nameX) is not our reserved entry.
   if (afterName !== undefined && afterName !== "(" && IDENT_CONTINUATION.test(afterName)) {
     return { kind: "non-envelope" };
   }
   if (afterName !== "(") {
     return malformed(
       "expected-open-paren",
-      `'${ENVELOPE_NAME}' must be immediately followed by "(" — found ${describeAfterName(afterName)}; grammar is ${ENVELOPE_NAME}(<strict JSON>)`,
+      `'${name}' must be immediately followed by "(" — found ${describeAfterName(afterName)}; grammar is ${name}(<strict JSON>)`,
     );
   }
 
-  const closeIdx = findClosingParen(src, ENVELOPE_NAME.length);
+  const closeIdx = findClosingParen(src, name.length);
   if (closeIdx < 0) {
     return malformed(
       "unterminated",
-      `'${ENVELOPE_NAME}' has no closing ")" before the end of input (grammar: ${ENVELOPE_NAME}(<strict JSON>))`,
+      `'${name}' has no closing ")" before the end of input (grammar: ${name}(<strict JSON>))`,
     );
   }
 
-  const rawJson = src.slice(ENVELOPE_NAME.length + 1, closeIdx);
+  const rawJson = src.slice(name.length + 1, closeIdx);
   if (rawJson.trim().length === 0) {
     return malformed(
       "missing-argument",
-      `'${ENVELOPE_NAME}()' requires exactly one strict-JSON argument (grammar: ${ENVELOPE_NAME}(<strict JSON>))`,
+      `'${name}()' requires exactly one strict-JSON argument (grammar: ${name}(<strict JSON>))`,
     );
   }
   if (hasTopLevelComma(rawJson)) {
     return malformed(
       "multiple-arguments",
-      `'${ENVELOPE_NAME}' expects exactly ONE strict-JSON argument, but found values separated by a top-level ","`,
+      `'${name}' expects exactly ONE strict-JSON argument, but found values separated by a top-level ","`,
     );
   }
 
-  let spec: unknown;
+  let value: unknown;
   try {
-    spec = JSON.parse(rawJson) as unknown;
+    value = JSON.parse(rawJson) as unknown;
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     return malformed(
       "invalid-json",
-      `'${ENVELOPE_NAME}' argument is not strict JSON: ${detail}`,
+      `'${name}' argument is not strict JSON: ${detail}`,
       detail,
     );
   }
@@ -217,9 +225,85 @@ export function parseTaskGroupEnvelope(code: unknown): EnvelopeParseResult {
   if (rest.length > 0) {
     return malformed(
       "trailing-content",
-      `unexpected content after the '${ENVELOPE_NAME}(...)' envelope: ${JSON.stringify(clip(rest, 60))} — only whitespace and one optional terminal ";" are allowed`,
+      `unexpected content after the '${name}(...)' envelope: ${JSON.stringify(clip(rest, 60))} — only whitespace and one optional terminal ";" are allowed`,
     );
   }
 
-  return { kind: "valid", spec, rawJson };
+  return { kind: "valid", value, rawJson };
+}
+
+/**
+ * Parse eval `code` against the Task Group envelope grammar.
+ *
+ * Total function: never throws, never evaluates JavaScript. Distinguishes
+ * ordinary eval code (`non-envelope`) from recognized-but-invalid envelopes
+ * (`malformed`, with code + message) from valid envelopes (`valid`, carrying
+ * the raw parsed JSON argument). A valid result is NOT schema-validated here —
+ * run `validateSpec` on `spec` downstream before compiling.
+ */
+export function parseTaskGroupEnvelope(code: unknown): EnvelopeParseResult {
+  const raw = parseNamedEnvelope(code, ENVELOPE_NAME);
+  if (raw.kind === "non-envelope") return { kind: "non-envelope" };
+  if (raw.kind === "malformed") return raw;
+  return { kind: "valid", spec: raw.value, rawJson: raw.rawJson };
+}
+
+export interface TaskGroupCollectSpec {
+  readonly groupId: string;
+  readonly resultId: string;
+}
+
+export type CollectEnvelopeParseResult =
+  | { readonly kind: "non-envelope" }
+  | { readonly kind: "malformed"; readonly error: EnvelopeParseError }
+  | { readonly kind: "valid"; readonly spec: TaskGroupCollectSpec; readonly rawJson: string };
+
+function collectMalformed(code: EnvelopeErrorCode, message: string): CollectEnvelopeParseResult {
+  return { kind: "malformed", error: { code, message } };
+}
+
+/**
+ * Parse the explicit collect envelope:
+ *
+ *   ompTaskGroupCollect({"groupId":"tg…","resultId":"tgbg_…"})
+ *
+ * The collect payload is strict: exactly two string keys, both with the
+ * plugin's identifier formats. No path, no extra fields, no code.
+ */
+export function parseTaskGroupCollectEnvelope(code: unknown): CollectEnvelopeParseResult {
+  const raw = parseNamedEnvelope(code, COLLECT_ENVELOPE_NAME);
+  if (raw.kind === "non-envelope") return { kind: "non-envelope" };
+  if (raw.kind === "malformed") return raw;
+  const value = raw.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return collectMalformed(
+      "invalid-json",
+      `'${COLLECT_ENVELOPE_NAME}' requires one JSON object with exactly "groupId" and "resultId"`,
+    );
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  const ALLOWED_COLLECT_KEYS: Record<string, true> = { groupId: true, resultId: true };
+  const extra = keys.filter((key) => ALLOWED_COLLECT_KEYS[key] !== true);
+  if (extra.length > 0) {
+    return collectMalformed(
+      "invalid-json",
+      `'${COLLECT_ENVELOPE_NAME}' accepts no extra fields (got ${extra.map((key) => JSON.stringify(key)).join(", ")}); use exactly {"groupId","resultId"}`,
+    );
+  }
+  const groupId = record.groupId;
+  if (typeof groupId !== "string" || !GROUP_ID_PATTERN.test(groupId)) {
+    return collectMalformed(
+      "invalid-json",
+      `'${COLLECT_ENVELOPE_NAME}'.groupId must be the lowercase group id from the dispatch receipt`,
+    );
+  }
+  const resultId = record.resultId;
+  if (typeof resultId !== "string" || !RESULT_ID_PATTERN.test(resultId)) {
+    return collectMalformed(
+      "invalid-json",
+      `'${COLLECT_ENVELOPE_NAME}'.resultId must be the tgbg_ result id from the dispatch receipt`,
+    );
+  }
+  return { kind: "valid", spec: { groupId, resultId }, rawJson: raw.rawJson };
 }

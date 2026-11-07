@@ -4,7 +4,7 @@ description: Use when planning or executing one batch of two or more independent
 
 # OMP Task Group
 
-Use this playbook to route one independent batch through the `omp-task-group` plugin. It uses OMP's native `eval` tool; it does not add or replace a tool.
+Use this playbook to route one independent batch through the `omp-task-group` plugin. It uses OMP's native `eval` tool and registers `task_group_result` and the internal write-approved `task_group_store_result` for explicitly backgrounded results; it never shadows or replaces `eval`.
 
 ## Choose the delegation tool
 
@@ -23,6 +23,7 @@ Example eval `code` for two independent review tasks:
 ompTaskGroup({
   "context": "Review the authentication change. Return evidence and concise findings.",
   "label": "auth-review",
+  "background": "auto",
   "tasks": [
     {
       "name": "auth-flow",
@@ -37,12 +38,31 @@ ompTaskGroup({
   ],
   "join": { "mode": "all" },
   "failure": { "mode": "collect" },
-  "execution": { "strategy": "auto", "concurrency": "auto" },
+  "execution": { "strategy": "auto", "concurrency": "auto", "mode": "auto" },
   "output": { "mode": "compact", "perTaskChars": 1200, "maxTotalChars": 8000 }
 });
 ```
 
 Keep each task self-contained and give it a unique name. Put shared context in `context`; put task-specific instructions in each task's `task`. Keep the whole envelope as the eval cell—extra code prevents recognition.
+
+## Background policy (two-phase native Workpool)
+
+Background Workpool is **Beta** and requires an explicit Collect. `background: "auto"` (default) and `"foreground"` mean one foreground eval cell; `execution.mode` accepts the same two values. Use the explicit background opt-in (`background: "require"` or `execution.mode: "background"`) only when the task genuinely benefits from continuing while the group runs.
+
+Background is accepted only for a real Workpool plan: homogeneous `join=all` + `failure=collect` tasks, `execution.concurrency="auto"`, no per-task schema or isolation, `output.mode` compact or structured, and pool not disabled by config. The numeric pool threshold does not apply. It does **not** depend on `eval.autoBackground`. Anything else is blocked before execution; there is no Fanout fallback.
+
+When a background group is accepted:
+
+- The first eval result is a short **dispatch receipt**, not the group result. It carries `details.background.state="dispatched"`, `delivery="workpool-async"`, `groupId`, `resultId`, `poolName`, the verified `itemIds`, `taskCount`, the planned `path`, and a `collect` envelope string. Never report it as success. If it errors or lacks verified item ids, dispatch is unconfirmed: do not re-dispatch.
+- OMP later delivers its own async-result notice. Its preview may contain raw, ungated aggregate child text and is **not** the Task Group result. Cancellation may produce no notice.
+- After the notice, automatically call eval again without asking the user to enter commands, in the **same kernel** (no `reset:true`) with exactly:
+  `ompTaskGroupCollect({"groupId":"tg…","resultId":"tgbg_…"})`
+  No extra fields, no path.
+  - `details.background.state="pending"` means the pool is still draining. Nothing was waited on; this is not a result. Call collect again later.
+  - `state="ready"` means collect verified the drained snapshot, ran the shared Result Gate, and the write-approved `task_group_store_result` tool validated and stored the private file. `groupState` is authoritative (`completed` / `failed` / `cancelled`); `isError` is false only for `completed`. Then read with `task_group_result {"action":"read","id":"tgbg_…"}` until `complete=true`, and `{"action":"consume","id":"tgbg_…"}` to delete it.
+  - `state="failed"` with a `stage` (`handle`/`state`/`decode`/`write`) is fail-closed: no verified result file was written. A `write` failure includes a denied write approval or store validation failure; report it and do not bypass approval. A `handle` failure means the kernel handle is gone; a session switch can instead reject collect before execution because its registration is gone. The pooled work may still be running—do not re-dispatch blindly.
+- Cancel with the normal write tool: `write({"path":"proc://<groupId>/kill"})`, then run collect. A readable snapshot yields a drained `cancelled` file (not success); a destroyed pool yields an explicit failure with no file.
+- Never fabricate a result from the native notice, a pending collect, or partial read. Never pass a path to collect or `task_group_result`.
 
 ## Settle and format results
 
@@ -59,4 +79,4 @@ Keep each task self-contained and give it a unique name. Put shared context in `
   missing, duplicated, malformed, truncated, or duplicate-key results fail closed.
   A post-dispatch recovery failure never reruns tasks through Fanout.
 
-The group requires a foreground native eval call. If the plugin blocks it because eval auto-background is enabled, report that requirement; do not work around it by running the group in the background or changing the user's settings.
+A foreground group requires an effectively disabled `eval.autoBackground`. The plugin diagnoses that setting on a best-effort basis; OMP defaults it to `false` in every mode. If the plugin blocks a foreground group, report the blocker and ask for `eval.autoBackground.enabled=false` in the active agent config, project config, or a `--config` overlay. The two-phase background path does not depend on that setting. Do not change the user's settings yourself, emulate a background manager, or cancel a host-owned job without the user's request.

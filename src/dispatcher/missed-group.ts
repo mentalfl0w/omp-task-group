@@ -20,9 +20,14 @@ export class MissedGroupDetector {
   private turnActive = false;
 
   constructor(
-    private readonly config: TaskGroupConfig,
+    private config: TaskGroupConfig,
     private readonly onCandidate: () => void,
   ) {}
+
+  setConfig(config: TaskGroupConfig): void {
+    this.config = config;
+    this.pending = [];
+  }
 
   onTurnStart(): void {
     this.turnActive = true;

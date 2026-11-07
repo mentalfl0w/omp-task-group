@@ -344,6 +344,13 @@ describe("live task group (TEST_INTEGRATION=1)", () => {
         const call = evalCalls[0] as ToolCall;
         expect(call.args.language).toBe("js");
         expect(call.args.timeout).toBe(0);
+        // A foreground Pool must not carry the background file transport:
+        // Smart Approve statically rejects its dormant dynamic write in both
+        // extension load orders.
+        const compiledCode = String(call.args.code);
+        expect(compiledCode).not.toContain("tgWriteBackgroundResult");
+        expect(compiledCode).not.toContain("writeFileSync");
+        expect(compiledCode).not.toContain("TG_BG_RESULT");
         const paired = pairCallsAndResults(entries);
         expect(paired).toHaveLength(1);
         const groupResult = paired[0]?.result;

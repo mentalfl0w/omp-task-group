@@ -66,6 +66,19 @@ export interface GroupRunResult {
   barrierViolated?: string;
   /** Compressed digest when output.mode=summarize succeeded. */
   summary?: string;
+  /**
+   * Result Gate text computed inside the background Eval cell with the shared
+   * gate core. Foreground payloads omit it and the host gate runs instead.
+   */
+  gateText?: string;
+  gateMode?: "compact" | "structured" | "summarize";
+  /** Character count reported by the in-cell gate; must equal gateText.length. */
+  gateDeliveredChars?: number;
+  /**
+   * Set when the in-cell gate could not fit mandatory metadata; the runner
+   * must surface this as an error instead of trusting gateText as success.
+   */
+  gateError?: string;
 }
 
 export interface TaskGroupBackend {

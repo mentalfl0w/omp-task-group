@@ -147,3 +147,34 @@ describe("planner", () => {
     expect(plan.reasons.join("\n")).toContain("join: all");
   });
 });
+
+describe("planner — two-phase Workpool background", () => {
+  const THREE = {
+    context: "c",
+    tasks: Array.from({ length: 3 }, (_, i) => ({ name: `t${i}`, agent: "scout", task: `do ${i}` })),
+    background: "require",
+    join: { mode: "all" },
+    failure: { mode: "collect" },
+  };
+
+  test("background forces pool eligibility below the auto-selection threshold", () => {
+    const spec = validateSpec(THREE);
+    const plan = planExecution(spec, CAPS, { enabled: "auto", threshold: 6, background: true });
+    expect(plan.strategy).toBe("pool");
+    expect(plan.fallbackReason).toBeUndefined();
+    expect(plan.reasons.join("\n")).toContain("the pool threshold is not applied");
+  });
+
+  test("background with an explicit fanout strategy is not silently upgraded", () => {
+    const spec = validateSpec({ ...THREE, execution: { strategy: "fanout", concurrency: "auto" } });
+    const plan = planExecution(spec, CAPS, { enabled: "auto", threshold: 6, background: true });
+    expect(plan.strategy).toBe("fanout");
+  });
+
+  test("background still fails closed when pool is disabled", () => {
+    const spec = validateSpec(THREE);
+    const plan = planExecution(spec, CAPS, { enabled: "off", threshold: 6, background: true });
+    expect(plan.strategy).toBe("fanout");
+    expect(plan.fallbackReason).toBe("Pool disabled by config");
+  });
+});

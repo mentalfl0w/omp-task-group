@@ -1,7 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { decodeEvalGroupResult, EvalResultError } from "../../src/backend/eval-result";
+import {
+  decodeEvalGroupResult,
+  decodeEvalPayload,
+  decodePoolBackgroundCollect,
+  decodePoolBackgroundDispatch,
+  EvalResultError,
+} from "../../src/backend/eval-result";
 import type { GroupRunResult, TaskOutcome } from "../../src/backend/interface";
-import { EVAL_RESULT_PROTOCOL, EVAL_RESULT_TRANSPORT } from "../../src/compiler/program";
+import {
+  EVAL_RESULT_PROTOCOL,
+  EVAL_RESULT_TRANSPORT,
+  POOL_BACKGROUND_COLLECT_TRANSPORT,
+  POOL_BACKGROUND_DISPATCH_TRANSPORT,
+} from "../../src/compiler/program";
 import { isRecord } from "../../src/guards";
 import { validateSpec } from "../../src/schema/task-group";
 
@@ -482,4 +493,178 @@ describe("groupState mapping", () => {
     expect(() => decodeResult(details([overflow]))).toThrow(/exceeds OMP's structured-view capacity/);
   });
 
+  test("decodeEvalPayload accepts and validates in-cell gate fields", () => {
+    const gateText = "Task Group completed\n\n✓ alpha · scout";
+    const result = decodeEvalPayload(
+      makePayload({ gateText, gateMode: "compact", gatedChars: gateText.length }),
+      SPEC,
+      GID,
+    );
+    expect(result.gateText).toBe(gateText);
+    expect(result.gateMode).toBe("compact");
+    expect(result.gateDeliveredChars).toBe(gateText.length);
+    const failed = decodeEvalPayload(
+      makePayload({
+        gateText: "Result gate failed for Task Group completed",
+        gateMode: "compact",
+        gatedChars: "Result gate failed for Task Group completed".length,
+        gateError: "necessary task metadata exceeds maxTotalChars",
+      }),
+      SPEC,
+      GID,
+    );
+    expect(failed.gateError).toBe("necessary task metadata exceeds maxTotalChars");
+    expect(() =>
+      decodeEvalPayload(
+        makePayload({
+          gateText: "x",
+          gateMode: "compact",
+          gatedChars: 1,
+          gateError: "",
+        }),
+        SPEC,
+        GID,
+      ),
+    ).toThrow(/gateError must be a non-empty string/);
+    expect(() =>
+      decodeEvalPayload(makePayload({ gateText, gateMode: "compact", gatedChars: 1 }), SPEC, GID),
+    ).toThrow(/gatedChars must equal/);
+    expect(() => decodeEvalPayload(makePayload({ gateText: "x", gateMode: "other", gatedChars: 1 }), SPEC, GID)).toThrow(
+      /gateMode must be/,
+    );
+    expect(() =>
+      decodeEvalPayload({ ...makePayload(), outcomes: [{ name: "alpha", agent: "scout", status: "succeeded" }] }, SPEC, GID),
+    ).toThrow(/missing an outcome for task "beta"/);
+  });
+});
+
+// ── Two-phase Workpool background receipts ────────────────────────────
+
+describe("background control receipts", () => {
+  const GROUP = "tg-abc";
+  const RESULT = "tgbg_0123456789abcdef";
+  const PATH = "/tmp/omp-task-group-results-x/tg-abc.json";
+
+  function details(value: Record<string, unknown>): Record<string, unknown> {
+    return { cells: [{ views: [{ view: { kind: "json", value } }] }] };
+  }
+
+  function dispatchReceipt(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      protocol: EVAL_RESULT_PROTOCOL,
+      transport: POOL_BACKGROUND_DISPATCH_TRANSPORT,
+      groupId: GROUP,
+      resultId: RESULT,
+      state: "dispatched",
+      poolName: GROUP,
+      itemIds: ["i1", "i2"],
+      taskCount: 2,
+      ...extra,
+    };
+  }
+
+  function collectReceipt(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      protocol: EVAL_RESULT_PROTOCOL,
+      transport: POOL_BACKGROUND_COLLECT_TRANSPORT,
+      groupId: GROUP,
+      resultId: RESULT,
+      state: "ready",
+      groupState: "completed",
+      counts: { succeeded: 2, failed: 0, cancelled: 0 },
+      pool: {
+        queued: 0, running: 0, completed: 2, failed: 0, cancelled: 0,
+        closed: true, pending: 0, batches: 1,
+      },
+      path: PATH,
+      checksum: "a".repeat(64),
+      payloadChars: 123,
+      ...extra,
+    };
+  }
+
+  test("dispatch success requires exactly one verified item id per task", () => {
+    const decoded = decodePoolBackgroundDispatch(details(dispatchReceipt()), {
+      groupId: GROUP, resultId: RESULT, taskCount: 2,
+    });
+    expect(decoded.state).toBe("dispatched");
+    if (decoded.state !== "dispatched") return;
+    expect(decoded.itemIds).toEqual(["i1", "i2"]);
+    expect(decoded.poolName).toBe(GROUP);
+
+    for (const bad of [
+      dispatchReceipt({ itemIds: ["i1"] }),
+      dispatchReceipt({ itemIds: ["i1", "i1"] }),
+      dispatchReceipt({ itemIds: ["i1", ""] }),
+      dispatchReceipt({ taskCount: 3 }),
+      dispatchReceipt({ poolName: "other" }),
+    ]) {
+      expect(() =>
+        decodePoolBackgroundDispatch(details(bad), { groupId: GROUP, resultId: RESULT, taskCount: 2 }),
+      ).toThrow(EvalResultError);
+    }
+  });
+
+  test("dispatch failure is explicit and never yields ids", () => {
+    const decoded = decodePoolBackgroundDispatch(
+      details(dispatchReceipt({ state: "failed", stage: "push", reason: "boom", dispatched: true, cancelled: false, itemIds: undefined })),
+      { groupId: GROUP, resultId: RESULT, taskCount: 2 },
+    );
+    expect(decoded.state).toBe("failed");
+    if (decoded.state !== "failed") return;
+    expect(decoded.dispatched).toBe(true);
+    expect(decoded.cancelled).toBe(false);
+  });
+
+  test("async, duplicate, foreign, or missing receipts fail closed", () => {
+    const expected = { groupId: GROUP, resultId: RESULT, taskCount: 2 };
+    expect(() => decodePoolBackgroundDispatch({ async: { state: "running" }, cells: [] }, expected)).toThrow(/auto-backgrounded/);
+    expect(() => decodePoolBackgroundDispatch({ cells: [] }, expected)).toThrow(/no .* JSON view/);
+    expect(() =>
+      decodePoolBackgroundDispatch(
+        { cells: [{ views: [
+          { view: { kind: "json", value: dispatchReceipt() } },
+          { view: { kind: "json", value: dispatchReceipt() } },
+        ] }] },
+        expected,
+      ),
+    ).toThrow(/expected exactly one/);
+    expect(() =>
+      decodePoolBackgroundDispatch(details(dispatchReceipt({ resultId: "tgbg_ffffffffffffffff" })), expected),
+    ).toThrow(/different result id/);
+  });
+
+  test("collect pending is explicit and carries no success fields", () => {
+    const decoded = decodePoolBackgroundCollect(
+      details(collectReceipt({ state: "pending", groupState: undefined, path: undefined, checksum: undefined, payloadChars: undefined, reason: "workpool not closed" })),
+      { groupId: GROUP, resultId: RESULT, path: PATH },
+    );
+    expect(decoded.state).toBe("pending");
+    expect(decoded.groupState).toBeUndefined();
+    expect(decoded.counts).toEqual({ succeeded: 2, failed: 0, cancelled: 0 });
+  });
+
+  test("collect ready requires the registered path and a hex checksum", () => {
+    const expected = { groupId: GROUP, resultId: RESULT, path: PATH };
+    expect(decodePoolBackgroundCollect(details(collectReceipt()), expected).state).toBe("ready");
+    for (const bad of [
+      collectReceipt({ path: "/tmp/foreign.json" }),
+      collectReceipt({ checksum: "not-hex" }),
+      collectReceipt({ payloadChars: -1 }),
+      collectReceipt({ groupState: "unknown" }),
+      collectReceipt({ counts: undefined }),
+    ]) {
+      expect(() => decodePoolBackgroundCollect(details(bad), expected)).toThrow(EvalResultError);
+    }
+  });
+
+  test("collect failure is explicit and keeps stage/reason", () => {
+    const decoded = decodePoolBackgroundCollect(
+      details(collectReceipt({ state: "failed", stage: "handle", reason: "kernel reset", groupState: undefined, path: undefined, checksum: undefined, payloadChars: undefined })),
+      { groupId: GROUP, resultId: RESULT, path: PATH },
+    );
+    expect(decoded.state).toBe("failed");
+    expect(decoded.stage).toBe("handle");
+    expect(decoded.reason).toBe("kernel reset");
+  });
 });

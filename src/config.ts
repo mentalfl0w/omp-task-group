@@ -7,6 +7,21 @@
  *
  * Architecture policy keys (privateApis/failClosed) are intentionally NOT
  * configurable: they are invariants of this plugin, not preferences.
+ *
+ * There is no task-group background switch. Background execution is an
+ * explicit per-group two-phase Workpool opt-in (`background: "require"` or
+ * `execution.mode: "background"`): a short dispatch cell returns after verified
+ * `workpool.push()` ids, OMP's native async-result notice signals completion,
+ * and an explicit collect cell writes the checksummed private result file read
+ * by `task_group_result`. It does not depend on OMP's eval.autoBackground
+ * setting; `auto` and `foreground` stay foreground. OMP's autoBackground
+ * setting is still diagnosed in barriers.ts for foreground compatibility.
+ *
+ * `background.retentionMinutes` only bounds how long an observed, unconsumed
+ * result file stays readable for the group that registered it. It does not
+ * enable background execution and never changes OMP's own settings. Each
+ * group carries the config resolved from its own cwd, so groups with different
+ * project overlays keep independent retention windows.
  */
 
 import type { FailureMode, JoinMode, OutputMode, Strategy } from "./schema/task-group";
@@ -40,6 +55,15 @@ export interface TelemetryConfig {
   detectMissedGroups: boolean;
 }
 
+export interface BackgroundConfig {
+  /**
+   * How long an observed, unconsumed background result file stays readable.
+   * Bounds: 1..1440 minutes (one day). The pending deadline before a result
+   * file exists is fixed at two hours and is not affected by this value.
+   */
+  retentionMinutes: number;
+}
+
 export interface TaskGroupConfig {
   enabled: boolean;
   dispatcher: DispatcherConfig;
@@ -52,6 +76,7 @@ export interface TaskGroupConfig {
     model: "smol" | "default" | "slow";
   };
   telemetry: TelemetryConfig;
+  background: BackgroundConfig;
 }
 
 export function defaultConfig(): TaskGroupConfig {
@@ -68,6 +93,7 @@ export function defaultConfig(): TaskGroupConfig {
     output: { mode: "compact", perTaskChars: 1200, maxTotalChars: 8000, preserveHandles: true },
     summarize: { enabled: false, model: "smol" },
     telemetry: { enabled: true, detectMissedGroups: true },
+    background: { retentionMinutes: 30 },
   };
 }
 
@@ -168,6 +194,15 @@ export function validateConfig(raw: unknown): TaskGroupConfig {
   mergeSection(raw, "telemetry", (t) => {
     cfg.telemetry.enabled = bool(t.enabled, "telemetry.enabled", true);
     cfg.telemetry.detectMissedGroups = bool(t.detectMissedGroups, "telemetry.detectMissedGroups", true);
+  });
+  mergeSection(raw, "background", (b) => {
+    cfg.background.retentionMinutes = intIn(
+      b.retentionMinutes,
+      "background.retentionMinutes",
+      1,
+      1440,
+      30,
+    );
   });
 
   return cfg;

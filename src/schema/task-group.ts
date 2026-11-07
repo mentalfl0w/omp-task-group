@@ -10,6 +10,18 @@ export type JoinMode = "all" | "any" | "quorum";
 export type FailureMode = "collect" | "fail_fast";
 export type Strategy = "auto" | "fanout" | "pool";
 export type OutputMode = "compact" | "structured" | "summarize";
+/**
+ * Background policy. `auto` and `foreground` execute one foreground cell.
+ * `require` is the explicit two-phase Workpool background opt-in: the dispatch
+ * cell returns after a verified `push()`, and an explicit collect cell later
+ * writes the checksummed result file read with `task_group_result`.
+ */
+export type BackgroundMode = "auto" | "foreground" | "require";
+/**
+ * Execution-mode policy. `background` is the explicit background opt-in with
+ * the same two-phase Workpool delivery as `background: "require"`.
+ */
+export type ExecutionMode = "auto" | "foreground" | "background";
 
 export interface TaskGroupTask {
   /** Stable identifier; becomes part of the child agent label. */
@@ -43,6 +55,12 @@ export interface TaskGroupExecution {
   strategy: Strategy;
   /** "auto" inherits OMP's own concurrency; integer further caps (never raises). */
   concurrency: "auto" | number;
+  /**
+   * Background opt-in, mirroring `background`. `background` requests the
+   * two-phase Workpool background delivery; `auto` and `foreground` mean one
+   * foreground cell.
+   */
+  mode: ExecutionMode;
 }
 
 export interface TaskGroupOutput {
@@ -57,6 +75,11 @@ export interface TaskGroupSpec {
   context: string;
   /** Short human label used in TUI/RPC surfaces. */
   label?: string;
+  /**
+   * Background policy. `require` requests the two-phase Workpool background
+   * delivery; `auto` and `foreground` stay foreground.
+   */
+  background: BackgroundMode;
   tasks: TaskGroupTask[];
   join: TaskGroupJoin;
   failure: TaskGroupFailure;
@@ -78,6 +101,18 @@ export class SpecValidationError extends Error {
 }
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,47}$/;
+
+/** Shared explanation for contradictory explicit foreground/background policies. */
+const BACKGROUND_CONFLICT_REASON =
+  'explicit foreground and explicit background policies cannot be combined; use background="require" or execution.mode="background" for the two-phase Workpool background opt-in, or leave both foreground';
+
+/**
+ * True when the spec explicitly requests background execution. `auto` stays
+ * foreground: background is never inferred from configuration alone.
+ */
+export function isBackgroundRequested(spec: Pick<TaskGroupSpec, "background" | "execution">): boolean {
+  return spec.background === "require" || spec.execution.mode === "background";
+}
 
 function asRecord(value: unknown, what: string): Record<string, unknown> {
   if (value === undefined || value === null) return {};
@@ -111,6 +146,14 @@ export function validateSpec(raw: unknown): TaskGroupSpec {
   const context = asString(root.context, "context");
   if (context === undefined || context.trim().length === 0) {
     throw new SpecValidationError("taskGroup.context is required and must be non-empty");
+  }
+
+  const backgroundRaw = root.background ?? "auto";
+  let background: BackgroundMode;
+  if (backgroundRaw === "auto" || backgroundRaw === "foreground" || backgroundRaw === "require") {
+    background = backgroundRaw;
+  } else {
+    throw new SpecValidationError('taskGroup.background must be "auto" | "foreground" | "require"');
   }
 
   const rawTasks = root.tasks;
@@ -210,6 +253,22 @@ export function validateSpec(raw: unknown): TaskGroupSpec {
     concurrency = c;
   }
 
+  const executionModeRaw = execRec.mode ?? "auto";
+  let executionMode: ExecutionMode;
+  if (executionModeRaw === "auto" || executionModeRaw === "foreground" || executionModeRaw === "background") {
+    executionMode = executionModeRaw;
+  } else {
+    throw new SpecValidationError(
+      'taskGroup.execution.mode must be "auto" | "foreground" | "background"',
+    );
+  }
+  if (background === "require" && executionMode === "foreground") {
+    throw new SpecValidationError(`taskGroup.background="require" conflicts with execution.mode="foreground": ${BACKGROUND_CONFLICT_REASON}`);
+  }
+  if (background === "foreground" && executionMode === "background") {
+    throw new SpecValidationError(`taskGroup.background="foreground" conflicts with execution.mode="background": ${BACKGROUND_CONFLICT_REASON}`);
+  }
+
   const outputRec = asRecord(root.output, "output");
   const outputMode = asString(outputRec.mode, "output.mode") ?? "compact";
   if (outputMode !== "compact" && outputMode !== "structured" && outputMode !== "summarize") {
@@ -236,10 +295,11 @@ export function validateSpec(raw: unknown): TaskGroupSpec {
   return {
     context,
     label: asString(root.label, "label") ?? undefined,
+    background,
     tasks,
     join,
     failure: { mode: failureMode },
-    execution: { strategy, concurrency },
+    execution: { strategy, concurrency, mode: executionMode },
     output: { mode: outputMode, perTaskChars, maxTotalChars, preserveHandles },
     pool: { enabled: poolEnabledRaw, threshold: poolThreshold, fallback: poolFallback },
   };

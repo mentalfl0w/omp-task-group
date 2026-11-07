@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  COLLECT_ENVELOPE_NAME,
   ENVELOPE_NAME,
+  parseTaskGroupCollectEnvelope,
   parseTaskGroupEnvelope,
   type EnvelopeErrorCode,
   type EnvelopeParseError,
@@ -359,5 +361,69 @@ describe("envelope parser — discrimination semantics", () => {
     expectValid('ompTaskGroup({"context":""})');
     expectValid('ompTaskGroup({"tasks":[]})');
     expect(expectValid("ompTaskGroup({})").spec).toEqual({});
+  });
+});
+
+// ── Collect envelope ───────────────────────────────────────────────────
+
+describe("collect envelope parser", () => {
+  const GROUP = "tgabc123";
+  const RESULT = "tgbg_0123456789abcdef";
+
+  function collect(value: unknown): string {
+    return `${COLLECT_ENVELOPE_NAME}(${JSON.stringify(value)})`;
+  }
+
+  test("accepts exactly {groupId,resultId} with optional whitespace and one semicolon", () => {
+    const parsed = parseTaskGroupCollectEnvelope(collect({ groupId: GROUP, resultId: RESULT }));
+    expect(parsed.kind).toBe("valid");
+    if (parsed.kind !== "valid") return;
+    expect(parsed.spec).toEqual({ groupId: GROUP, resultId: RESULT });
+    expect(parseTaskGroupCollectEnvelope(`  ${collect({ resultId: RESULT, groupId: GROUP })};  `).kind).toBe("valid");
+  });
+
+  test("the group envelope parser never claims a collect envelope", () => {
+    expect(parseTaskGroupEnvelope(collect({ groupId: GROUP, resultId: RESULT })).kind).toBe("non-envelope");
+    expect(parseTaskGroupCollectEnvelope(`ompTaskGroup({})`).kind).toBe("non-envelope");
+    expect(parseTaskGroupCollectEnvelope("ompTaskGroupCollectish({})").kind).toBe("non-envelope");
+  });
+
+  test("rejects extra fields, missing fields, and model-supplied paths", () => {
+    for (const bad of [
+      { groupId: GROUP, resultId: RESULT, path: "/tmp/evil.json" },
+      { groupId: GROUP },
+      { resultId: RESULT },
+      { groupId: GROUP, resultId: RESULT, action: "read" },
+    ]) {
+      const parsed = parseTaskGroupCollectEnvelope(collect(bad));
+      expect(parsed.kind).toBe("malformed");
+      if (parsed.kind === "malformed") expect(parsed.error.code).toBe("invalid-json");
+    }
+  });
+
+  test("rejects malformed identifiers and non-object arguments", () => {
+    for (const bad of [
+      { groupId: "TG-BAD", resultId: RESULT },
+      { groupId: GROUP, resultId: "tgbg_not-hex" },
+      { groupId: 7, resultId: RESULT },
+      [],
+      null,
+      "group",
+    ]) {
+      expect(parseTaskGroupCollectEnvelope(collect(bad)).kind).toBe("malformed");
+    }
+  });
+
+  test("keeps the shared grammar errors", () => {
+    const malformed = (code: string): EnvelopeParseError => {
+      const parsed = parseTaskGroupCollectEnvelope(code);
+      expect(parsed.kind).toBe("malformed");
+      return parsed.kind === "malformed" ? parsed.error : { code: "invalid-json", message: "" };
+    };
+    expect(malformed("ompTaskGroupCollect ({})").code).toBe("expected-open-paren");
+    expect(malformed("ompTaskGroupCollect({").code).toBe("unterminated");
+    expect(malformed("ompTaskGroupCollect()").code).toBe("missing-argument");
+    expect(malformed("ompTaskGroupCollect({}, {})").code).toBe("multiple-arguments");
+    expect(malformed(collect({ groupId: GROUP, resultId: RESULT }) + " more()").code).toBe("trailing-content");
   });
 });
